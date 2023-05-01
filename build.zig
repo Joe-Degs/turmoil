@@ -11,17 +11,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-
     main.install();
-
     const run_cmd = main.run();
-
     run_cmd.step.dependOn(b.getInstallStep());
-
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
-
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
@@ -31,38 +26,48 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&main_tests.step);
 
-    // add each challenge directory as a buildable artifact
+    // For every challenge, we add the challenge's source directory and the
+    // specific maelstrom commands for running the test for the challenge
     const challenges = [_]struct {
         name: []const u8,
+        args: []const []const u8,
     }{
         .{
             .name = "echo",
+            .args = &[_][]const u8{ "--node-count", "1", "--time-limit", "10" },
         },
     };
 
     inline for (challenges) |challenge| {
+
+        // build the challenge binary
         const exe = b.addExecutable(.{
             .name = challenge.name,
-            .root_source_file = .{ .path = "src/" ++ challenge.name ++ "/main.zig" },
+            .root_source_file = .{
+                .path = "src/" ++ challenge.name ++ "/main.zig",
+            },
             .target = target,
             .optimize = optimize,
         });
-
         exe.install();
 
-        const exec_cmd = exe.run();
+        // add command to execute the maelstrom test for the challenge after build
+        const exec_cmd = b.addSystemCommand(&[_][]const u8{
+            "./maelstrom/maelstrom",
+            "test",
+            "-w",
+            challenge.name,
+            "--bin",
+            "zig-out/bin/" ++ challenge.name,
+        } ++ challenge.args);
 
-        exec_cmd.step.dependOn(b.getInstallStep());
-
-        if (b.args) |args| {
-            run_cmd.addArgs(args);
-        }
-
-        const exec_step = b.step("run", "Run the app");
-        exec_step.dependOn(&run_cmd.step);
+        const exec_step = b.step(
+            "run_" ++ challenge.name,
+            "Run the " ++ challenge.name ++ " challenge",
+        );
+        exec_step.dependOn(&exec_cmd.step);
     }
 }
