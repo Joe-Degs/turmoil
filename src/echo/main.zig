@@ -1,5 +1,6 @@
 const std = @import("std");
+const Node = @import("../Node.zig");
 
 pub fn main() void {
-    std.debug.print("echo binary\n", .{});
+    var node = Node.init(std.heap.page_allocator);
 }
