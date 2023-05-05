@@ -33,13 +33,19 @@ pub fn build(b: *std.Build) void {
     // specific maelstrom commands for running the test for the challenge
     const challenges = [_]struct {
         name: []const u8,
+        type: []const u8,
         args: []const []const u8,
     }{
         .{
             .name = "echo",
+            .type = "echo",
             .args = &[_][]const u8{ "--node-count", "1", "--time-limit", "10" },
         },
     };
+
+    const node_module = b.addModule("Node", .{
+        .source_file = .{ .path = "./src/Node.zig" },
+    });
 
     inline for (challenges) |challenge| {
 
@@ -52,6 +58,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
+        exe.addModule("Node", node_module);
         exe.install();
 
         // add command to execute the maelstrom test for the challenge after build
@@ -59,10 +66,11 @@ pub fn build(b: *std.Build) void {
             "./maelstrom/maelstrom",
             "test",
             "-w",
-            challenge.name,
+            challenge.type,
             "--bin",
             "zig-out/bin/" ++ challenge.name,
         } ++ challenge.args);
+        exec_cmd.step.dependOn(b.getInstallStep());
 
         const exec_step = b.step(
             "run_" ++ challenge.name,

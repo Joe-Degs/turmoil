@@ -22,14 +22,14 @@ allocator: Allocator = undefined,
 arena: std.heap.ArenaAllocator = undefined,
 
 /// unique string identifer used to route messages to and from the node
-id: []const u8 = undefined,
+id: []u8 = undefined,
 
 // the id of the next message that goes out of this node
 next_id: usize = 0,
 
 /// ids of maelstrom internal clients, they send messages to nodes and expect
 /// responses back.
-node_ids: [][]const u8 = undefined,
+node_ids: std.ArrayList([]const u8) = undefined,
 
 ///
 handlers: std.StringHashMap(Method) = undefined,
@@ -41,14 +41,23 @@ stdout: io.BufferedWriter(4096, @TypeOf(out)) = io.bufferedWriter(out),
 /// make a new node that is fit to participate in the network. An allocator is
 /// needed to store things that the node relies on to do relevant work.
 pub fn init(allocator: Allocator) Node {
-    return .{
+    var node = Node{
         .allocator = allocator,
         .arena = std.heap.ArenaAllocator.init(allocator),
+        .node_ids = std.ArrayList([]const u8).init(allocator),
+        .handlers = std.StringHashMap(Method).init(allocator),
     };
+    return node;
 }
 
 pub fn deinit(node: *Node) void {
+    // not soo sure about this one but we keep it for now
     node.arena.deinit();
+    node.node_ids.deinit();
+    node.handlers.deinit();
+
+    // deallocate node if its initialized
+    if (node.id.len > 0) node.allocator.free(node.id);
 }
 
 /// register a method for handling a specific kind of message that flows through
@@ -70,6 +79,77 @@ pub fn reader(node: *Node) @TypeOf(node.stdin.reader()) {
 /// write everything in the buffer out to the the underlying stream.
 pub fn flush(node: *Node) !void {
     try node.stdout.flush();
+}
+
+/// wait and listen for messages on the network and delegate handlers to handle them.
+pub fn run(node: *Node) !void {
+    var buf: [512]u8 = undefined;
+    var std_reader = node.reader();
+
+    while (true) {
+        var res = std_reader.readUntilDelimiter(&buf, '\n') catch |err| {
+            log.err("failed to read json stream: {}", .{err});
+            continue;
+        };
+        log.err("recieved message: {s}", .{res});
+        var message = try Message.decode(node.arena.allocator(), res, true);
+        try node.processMessage(message);
+    }
+}
+
+/// determine what to do with packet
+fn processMessage(node: *Node, msg: Message) !void {
+    defer node.arena.deinit();
+
+    // handle init message
+    if (std.mem.eql(u8, msg.getType(), "init")) {
+        node.handleInitMessage(msg) catch |err| {
+            log.err("failed to initialize node: {}", .{err});
+            return err;
+        };
+    }
+}
+
+/// initialize node for participating in the network
+fn handleInitMessage(node: *Node, msg: Message) !void {
+    // set the node id
+    const id = msg.get("node_id").?.String;
+    node.id = try node.allocator.alloc(u8, id.len);
+    @memcpy(node.id.ptr, id.ptr, id.len);
+
+    // then add the node ids of peers in the network
+    const node_ids = msg.get("node_ids").?.Array;
+    for (node_ids.items) |node_id| try node.node_ids.append(node_id.String);
+
+    // make the body of the init response
+    const response = .{
+        .type = "init_ok",
+        .in_reply_to = msg.get("msg_id").?.Integer,
+    };
+
+    // make and send init_ok message
+    const res_msg = try Message.from(node.arena.allocator(), node.id, null, response);
+    defer node.arena.deinit();
+    try node.send(res_msg);
+}
+
+/// send message into the network
+pub fn send(node: *Node, msg: Message) !void {
+    var buf: [512]u8 = undefined;
+    var buffer = std.io.fixedBufferStream(&buf);
+    const std_writer = node.writer();
+
+    // make messasge json
+    msg.json(buffer.writer()) catch |err| {
+        log.err("could not decode json: {}", .{err});
+        return;
+    };
+
+    std_writer.writeAll(buffer.getWritten()) catch |err| {
+        log.err("could not write into the ether: {}", .{err});
+    };
+    _ = std_writer.write("\n") catch return;
+    node.flush() catch return;
 }
 
 /// Messages are json objects routed between different nodes participating in the
@@ -124,12 +204,12 @@ pub const Message = struct {
     }
 
     /// decodeMessage unmarshals a json string into a message object, it allocate's
-    /// memory which must be freed when the message parsing and processing is done.
+    /// memory which must be freed when message is no longer in use.
     ///
     /// I'll recommend an arena allocator that pass in when a request comes in and that
     /// you free when the request processing is done.
-    pub fn decode(allocator: Allocator, bytes: []const u8) !Self {
-        var parser = std.json.Parser.init(allocator, false);
+    pub fn decode(allocator: Allocator, bytes: []const u8, copy: bool) !Self {
+        var parser = std.json.Parser.init(allocator, copy);
 
         var tree = parser.parse(bytes) catch |err| {
             log.err("failed to parse message: {}", .{err});
@@ -199,7 +279,7 @@ test "message from json string" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
-    const msg_obj = try Message.decode(arena.allocator(), msg);
+    const msg_obj = try Message.decode(arena.allocator(), msg, false);
     try testing.expect(std.mem.eql(u8, "n1", msg_obj.src.?));
     try testing.expect(std.mem.eql(u8, "c1", msg_obj.dest.?));
 
