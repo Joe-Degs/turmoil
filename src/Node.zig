@@ -8,7 +8,7 @@ const Allocator = std.mem.Allocator;
 const testing = std.testing;
 const assert = std.debug.assert;
 
-const log = std.log.scoped(.maelstrom_node);
+const log = std.log.scoped(.NODE);
 
 const out = io.getStdOut().writer();
 const in = io.getStdIn().reader();
@@ -16,7 +16,7 @@ const in = io.getStdIn().reader();
 const Node = @This();
 
 /// Methods handle messages
-const Method = *const fn (*Node, Message) error{InvalidRequest}!void;
+const Method = *const fn (*Node, *Message) error{InvalidRequest}!void;
 
 allocator: Allocator = undefined,
 arena: std.heap.ArenaAllocator = undefined,
@@ -25,7 +25,7 @@ arena: std.heap.ArenaAllocator = undefined,
 id: []u8 = undefined,
 
 // the id of the next message that goes out of this node
-next_id: usize = 0,
+next_id: usize = 1,
 
 /// ids of maelstrom internal clients, they send messages to nodes and expect
 /// responses back.
@@ -51,13 +51,18 @@ pub fn init(allocator: Allocator) Node {
 }
 
 pub fn deinit(node: *Node) void {
-    // not soo sure about this one but we keep it for now
-    node.arena.deinit();
     node.node_ids.deinit();
     node.handlers.deinit();
 
+    // not soo sure about this one but we keep it for now
+    node.arena.deinit();
+
     // deallocate node if its initialized
     if (node.id.len > 0) node.allocator.free(node.id);
+}
+
+pub fn msg_id(node: *Node) usize {
+    return @atomicRmw(usize, &node.next_id, .Add, 1, .Monotonic);
 }
 
 /// register a method for handling a specific kind of message that flows through
@@ -91,23 +96,39 @@ pub fn run(node: *Node) !void {
             log.err("failed to read json stream: {}", .{err});
             continue;
         };
-        log.err("recieved message: {s}", .{res});
-        var message = try Message.decode(node.arena.allocator(), res, true);
-        try node.processMessage(message);
+        log.info("recieved message: {s}", .{res});
+        try node.processMessage(res);
+
+        // let's reset the allocator for another round of allocations. but we
+        // don't want to be freeing memory in a tight loop so we retain the
+        // capacity for the next round.
+        //
+        // why don't we have GC's over here again?? :-/
+        // _ = node.arena.reset(.retain_capacity);
     }
 }
 
 /// determine what to do with packet
-fn processMessage(node: *Node, msg: Message) !void {
-    defer node.arena.deinit();
+fn processMessage(node: *Node, bytes: []const u8) !void {
+    var msg = try Message.decode(node.arena.allocator(), bytes, true);
+    const msg_type = msg.getType();
 
     // handle init message
-    if (std.mem.eql(u8, msg.getType(), "init")) {
+    if (std.mem.eql(u8, msg_type, "init")) {
         node.handleInitMessage(msg) catch |err| {
             log.err("failed to initialize node: {}", .{err});
             return err;
         };
+        return;
     }
+
+    var handler = node.handlers.get(msg_type) orelse {
+        log.err("no registered method for {s} messages", .{msg_type});
+        return error.NoMethod;
+    };
+
+    // TODO: better error handling for the handlers
+    try handler(node, &msg);
 }
 
 /// initialize node for participating in the network
@@ -124,11 +145,12 @@ fn handleInitMessage(node: *Node, msg: Message) !void {
     // make the body of the init response
     const response = .{
         .type = "init_ok",
+        .msg_id = node.msg_id(),
         .in_reply_to = msg.get("msg_id").?.Integer,
     };
 
     // make and send init_ok message
-    const res_msg = try Message.from(node.arena.allocator(), node.id, null, response);
+    const res_msg = try Message.from(node.arena.allocator(), node.id, msg.src, response);
     defer node.arena.deinit();
     try node.send(res_msg);
 }
@@ -145,7 +167,10 @@ pub fn send(node: *Node, msg: Message) !void {
         return;
     };
 
-    std_writer.writeAll(buffer.getWritten()) catch |err| {
+    const written = buffer.getWritten();
+    log.info("sending: {s}", .{written});
+
+    std_writer.writeAll(written) catch |err| {
         log.err("could not write into the ether: {}", .{err});
     };
     _ = std_writer.write("\n") catch return;
@@ -196,6 +221,10 @@ pub const Message = struct {
     // get a specific field of the message's body
     pub fn get(msg: Self, field: []const u8) ?std.json.Value {
         return msg.body.Object.get(field);
+    }
+
+    pub fn set(msg: *Self, key: []const u8, val: std.json.Value) !void {
+        return msg.body.Object.put(key, val);
     }
 
     // get the body type of a message
