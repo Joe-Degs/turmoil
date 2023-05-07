@@ -8,7 +8,7 @@ const Allocator = std.mem.Allocator;
 const testing = std.testing;
 const assert = std.debug.assert;
 
-const log = std.log.scoped(.NODE);
+const log = std.log.scoped(.Node);
 
 const out = io.getStdOut().writer();
 const in = io.getStdIn().reader();
@@ -16,13 +16,13 @@ const in = io.getStdIn().reader();
 const Node = @This();
 
 /// Methods handle messages
-const Method = *const fn (*Node, *Message) error{InvalidRequest}!void;
+const Method = *const fn (*Node, *Message) anyerror!void;
 
 allocator: Allocator = undefined,
 arena: std.heap.ArenaAllocator = undefined,
 
 /// unique string identifer used to route messages to and from the node
-id: []u8 = undefined,
+id: []u8 = &[_]u8{},
 
 // the id of the next message that goes out of this node
 next_id: usize = 1,
@@ -33,6 +33,18 @@ node_ids: std.ArrayList([]const u8) = undefined,
 
 ///
 handlers: std.StringHashMap(Method) = undefined,
+
+/// t
+status: enum {
+    /// the server has not yet recieved an `init` request
+    uninitialized,
+
+    /// the server has recieved an `init` request and has been inited
+    initialized,
+
+    /// server has shutdown and is not handling any requests.
+    shutdown,
+} = .uninitialized,
 
 /// STDOUT and STDIN streams for sending and receiving message in the network.
 stdin: io.BufferedReader(4096, @TypeOf(in)) = io.bufferedReader(in),
@@ -51,14 +63,13 @@ pub fn init(allocator: Allocator) Node {
 }
 
 pub fn deinit(node: *Node) void {
+    // deallocate node.id if its initialized
+    if (node.id.len > 0) node.allocator.free(node.id);
     node.node_ids.deinit();
     node.handlers.deinit();
 
     // not soo sure about this one but we keep it for now
     node.arena.deinit();
-
-    // deallocate node if its initialized
-    if (node.id.len > 0) node.allocator.free(node.id);
 }
 
 pub fn msg_id(node: *Node) usize {
@@ -87,14 +98,23 @@ pub fn flush(node: *Node) !void {
 }
 
 /// wait and listen for messages on the network and delegate handlers to handle them.
-pub fn run(node: *Node) !void {
-    var buf: [512]u8 = undefined;
-    var std_reader = node.reader();
+pub fn run(node: *Node, alt_reader: anytype) !void {
+    const std_in = if ((@typeInfo(@TypeOf(alt_reader)) != .Null) and
+        @hasDecl(@TypeOf(alt_reader), "read")) alt_reader else node.reader();
 
+    var buf: [512]u8 = undefined;
     while (true) {
-        var res = std_reader.readUntilDelimiter(&buf, '\n') catch |err| {
-            log.err("failed to read json stream: {}", .{err});
-            continue;
+        if (node.status == .shutdown) {
+            log.info("node is down!", .{});
+            return;
+        }
+
+        var res = std_in.readUntilDelimiter(&buf, '\n') catch |err| switch (err) {
+            error.EndOfStream, error.OperationAborted => continue,
+            else => {
+                log.err("failed to read json stream: {}", .{err});
+                return;
+            },
         };
         log.info("recieved message: {s}", .{res});
         try node.processMessage(res);
@@ -119,6 +139,9 @@ fn processMessage(node: *Node, bytes: []const u8) !void {
             log.err("failed to initialize node: {}", .{err});
             return err;
         };
+        return;
+    } else if (std.mem.eql(u8, msg_type, "shutdown")) {
+        node.status = .shutdown;
         return;
     }
 
@@ -157,23 +180,18 @@ fn handleInitMessage(node: *Node, msg: Message) !void {
 
 /// send message into the network
 pub fn send(node: *Node, msg: Message) !void {
-    var buf: [512]u8 = undefined;
-    var buffer = std.io.fixedBufferStream(&buf);
-    const std_writer = node.writer();
+    var std_out = node.writer();
 
-    // make messasge json
-    msg.json(buffer.writer()) catch |err| {
-        log.err("could not decode json: {}", .{err});
+    msg.json(std_out) catch |err| {
+        log.err("could not write json out: {}", .{err});
         return;
     };
 
-    const written = buffer.getWritten();
-    log.info("sending: {s}", .{written});
+    // std_writer.writeAll(written) catch |err| {
+    //     log.err("could not write into the ether: {}", .{err});
+    // };
 
-    std_writer.writeAll(written) catch |err| {
-        log.err("could not write into the ether: {}", .{err});
-    };
-    _ = std_writer.write("\n") catch return;
+    _ = std_out.write("\n") catch return;
     node.flush() catch return;
 }
 
@@ -239,6 +257,8 @@ pub const Message = struct {
     /// you free when the request processing is done.
     pub fn decode(allocator: Allocator, bytes: []const u8, copy: bool) !Self {
         var parser = std.json.Parser.init(allocator, copy);
+
+        // log.err("got json bytes: {s}", .{bytes});
 
         var tree = parser.parse(bytes) catch |err| {
             log.err("failed to parse message: {}", .{err});
@@ -356,4 +376,73 @@ test "message from body struct" {
     const msg_ids = msg.get("node_ids").?.Array;
     for (body.node_ids, msg_ids.items) |exp, val|
         try testing.expect(std.mem.eql(u8, exp, val.String));
+}
+const Tester = struct {
+    fn sendTo(src: []const u8, dest: []const u8, body: anytype, write_to: anytype) void {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+
+        var message = Message.from(
+            arena.allocator(),
+            src,
+            dest,
+            body,
+        ) catch unreachable;
+        message.json(write_to) catch unreachable;
+        _ = write_to.write("\n") catch unreachable;
+    }
+};
+
+test "handling messages" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    // want to send message to node
+    // node handles and checks for some expected fields in the message
+    // all is done with a testing.allocator
+
+    // let's use this whacky pipe to tunnel messages from test to node
+    const Pipe = @import("Pipe.zig").Pipe;
+
+    const test_message = .{
+        .type = "test",
+        .message = "This is a test message",
+        .number = @as(i64, 20),
+        .things = &[_][]const u8{ "one", "two" },
+    };
+    const test_src: []const u8 = "n0";
+    const test_dest: []const u8 = "t0";
+
+    var test_node = Node.init(testing.allocator);
+    defer test_node.deinit();
+
+    var allocator = testing.allocator;
+    var buffer = try testing.allocator.alloc(u8, 1050);
+    defer allocator.free(buffer);
+    var stream = Pipe(buffer);
+
+    const Handler = struct {
+        fn handler(_: *Node, msg: *Message) !void {
+            try testing.expect(std.mem.eql(u8, msg.getType(), test_message.type));
+            try testing.expect(
+                std.mem.eql(u8, msg.get("message").?.String, test_message.message),
+            );
+            try testing.expectEqual(msg.get("number").?.Integer, test_message.number);
+        }
+    };
+
+    // send the data into the buffer
+    Tester.sendTo(test_src, test_dest, test_message, stream.writer());
+    const shutdown = .{ .type = "shutdown" };
+    Tester.sendTo(test_src, test_dest, shutdown, stream.writer());
+
+    // create a thread to send message into the network
+    // var thread = try std.Thread.spawn(
+    //     .{},
+    //     Tester.sendTo,
+    //     .{},
+    // );
+    // thread.detach();
+
+    try test_node.registerMethod("test", Handler.handler);
+    try test_node.run(stream.reader());
+    try testing.expect(test_node.status == .shutdown);
 }

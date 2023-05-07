@@ -48,7 +48,6 @@ pub fn build(b: *std.Build) void {
     });
 
     inline for (challenges) |challenge| {
-
         // build the challenge binary
         const exe = b.addExecutable(.{
             .name = challenge.name,
