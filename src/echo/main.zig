@@ -4,11 +4,12 @@ const Message = Node.Message;
 
 /// recieve message and echo it back into the ether
 pub fn main() !void {
-    var node = Node.init(std.heap.page_allocator);
+    var node = try Node.init(std.heap.page_allocator);
+    defer node.deinit();
+
     try node.registerMethod("echo", echoHandler);
 
-    node.run() catch {
-        node.deinit();
+    node.run(null, null) catch {
         std.os.exit(1);
     };
 }
@@ -28,5 +29,5 @@ pub fn echoHandler(node: *Node, msg: *Message) error{InvalidRequest}!void {
 
     msg.dest = msg.src;
     msg.src = node.id;
-    try node.send(msg.*);
+    try node.send(msg.*, null);
 }
