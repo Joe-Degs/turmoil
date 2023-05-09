@@ -89,3 +89,54 @@ test "pipe - write/read" {
 
     try testing.expect(std.mem.eql(u8, hello, &buffer));
 }
+
+test "pipe - different threads read/write" {
+    var buf: [512]u8 = undefined;
+    var pipe = Pipe(&buf);
+
+    const hello = "hello world! fuckers";
+
+    try pipe.writer().writeAll(hello);
+
+    const Runner = struct {
+        fn run(stream: anytype, data: []const u8) void {
+            var buffer: [hello.len]u8 = undefined;
+            _ = stream.read(&buffer) catch unreachable;
+            testing.expect(std.mem.eql(u8, data, &buffer)) catch unreachable;
+        }
+    };
+
+    var thread = try std.Thread.spawn(
+        .{},
+        Runner.run,
+        .{ pipe.reader(), hello },
+    );
+    thread.join();
+}
+
+test "pipe - different threads write/read" {
+    var buf: [512]u8 = undefined;
+    var pipe = Pipe(&buf);
+
+    const hello = "hello world! fuckers";
+
+    const Runner = struct {
+        fn run(stream: anytype, data: []const u8) void {
+            _ = stream.writeAll(data) catch unreachable;
+        }
+    };
+
+    var thread = try std.Thread.spawn(
+        .{},
+        Runner.run,
+        .{ pipe.writer(), hello },
+    );
+    thread.detach();
+
+    // wait for a while
+    std.time.sleep(std.time.ns_per_ms);
+
+    var buffer: [hello.len]u8 = undefined;
+    _ = try pipe.reader().read(&buffer);
+    try testing.expect(std.mem.eql(u8, hello, &buffer));
+}
