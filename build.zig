@@ -42,6 +42,11 @@ pub fn build(b: *std.Build) void {
             .args = &[_][]const u8{ "--node-count", "1", "--time-limit", "10" },
         },
         .{
+            .name = "echo-service",
+            .workload = "echo",
+            .args = &[_][]const u8{ "--node-count", "1", "--time-limit", "10" },
+        },
+        .{
             .name = "maelstrom-unique-ids",
             .workload = "unique-ids",
             .args = &[_][]const u8{ "--time-limit", "30", "--rate", "1000", "--node-count", "3", "--time-limit", "10", "--availability", "total", "--nemesis", "partition" },
