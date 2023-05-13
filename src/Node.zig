@@ -317,7 +317,9 @@ pub const Service = struct {
     }
 };
 
-pub fn typeCtx(comptime T: type, ctx: *anyopaque) *T {
+/// given a generic type and a type erased pointer to that type,
+/// return a pointer that is properly aligned to the type
+pub fn alignCastPtr(comptime T: type, ctx: *anyopaque) *T {
     return @ptrCast(*T, @alignCast(@alignOf(T), ctx));
 }
 
