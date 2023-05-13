@@ -21,7 +21,7 @@ pub const Echo = struct {
     status: State = .uninitialized,
 
     fn getSelf(ctx: *anyopaque) *Echo {
-        return Node.typeCtx(Echo, ctx);
+        return Node.alignCastPtr(Echo, ctx);
     }
 
     fn start(ctx: *anyopaque, n: *Node) void {
