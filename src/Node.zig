@@ -156,7 +156,7 @@ pub fn runOnce(node: *Node, alloc: ?Allocator, alt_reader: anytype, alt_writer: 
 
     // handle init message
     if (std.mem.eql(u8, msg_type, "init")) {
-        node.handleInitMessage(allocator, msg, alt_writer) catch |err| {
+        node.handleInitMessage(&msg, alt_writer) catch |err| {
             log.err("failed to initialize node: {}", .{err});
             return err;
         };
@@ -168,16 +168,14 @@ pub fn runOnce(node: *Node, alloc: ?Allocator, alt_reader: anytype, alt_writer: 
 
     // check if there is a handler for service
     han: {
-        var handler = node.handlers.get(msg_type) orelse {
-            log.err("no registered method for {s} messages", .{msg_type});
-            break :han;
-        };
+        var handler = node.handlers.get(msg_type) orelse break :han;
 
         // TODO: better error handling for the handlers
         handler(node, &msg) catch |err| {
-            log.err("handler crashed with err: {}", .{err});
-            return;
+            log.err("handler for {s} crashed with err: {}", .{ msg_type, err });
+            return err;
         };
+        return;
     }
 
     var service = blk: {
@@ -187,16 +185,23 @@ pub fn runOnce(node: *Node, alloc: ?Allocator, alt_reader: anytype, alt_writer: 
                 break :blk node.services.get(key.*) orelse unreachable;
             }
         }
-        return error.NoHandler;
+        break :blk error.NoHandler;
+    } catch |err| {
+        log.err("handler/service not available for {s} messages: {}", .{ msg_type, err });
+        return err;
     };
+
     const service_state = service.state();
-    if (service_state == .running or service_state == .stopped) {
+    if (service_state == .running or service_state == .initialized) {
         service.handle(&msg);
-    } else service.start(node);
+    } else {
+        service.start(node);
+        service.handle(&msg);
+    }
 }
 
 /// initialize node for participating in the network
-fn handleInitMessage(node: *Node, allocator: Allocator, msg: Message, alt_writer: anytype) !void {
+fn handleInitMessage(node: *Node, msg: *Message, alt_writer: anytype) !void {
     // set the node id
     const id = msg.get("node_id").?.String;
     node.id = try node.allocator.alloc(u8, id.len);
@@ -206,15 +211,12 @@ fn handleInitMessage(node: *Node, allocator: Allocator, msg: Message, alt_writer
     const node_ids = msg.get("node_ids").?.Array;
     for (node_ids.items) |node_id| try node.node_ids.append(node_id.String);
 
-    // make the body of the init response
-    const response = .{
-        .type = "init_ok",
-        .msg_id = node.msg_id(),
-        .in_reply_to = msg.get("msg_id").?.Integer,
-    };
+    assert(msg.remove("node_ids"));
+    assert(msg.remove("node_id"));
 
-    // make and send init_ok message
-    const res_msg = try Message.from(allocator, node.id, msg.src, response);
+    msg.set("type", .{ .String = "init_ok" }) catch unreachable;
+    msg.dest = msg.src;
+    msg.src = node.id;
 
     // is this what I was doing that was fucking me up????????????
     //
@@ -226,12 +228,25 @@ fn handleInitMessage(node: *Node, allocator: Allocator, msg: Message, alt_writer
     //
     // defer node.arena.deinit();
 
-    try node.send(res_msg, alt_writer);
+    try node.send(msg, alt_writer);
+}
+
+/// set the messages in_reply_to and msg_id to the appropriate values before
+/// sending out
+pub fn setReplyTo(node: *Node, msg: *Message) void {
+    msg.set(
+        "in_reply_to",
+        msg.get("msg_id").?,
+    ) catch unreachable;
+
+    msg.set("msg_id", .{
+        .Integer = @intCast(i64, node.msg_id()),
+    }) catch unreachable;
 }
 
 /// send message into the network.
 /// send takes an alternative writer through which to send out messages
-pub fn send(node: *Node, msg: Message, alt_writer: anytype) !void {
+pub fn send(node: *Node, msg: *Message, alt_writer: anytype) !void {
     const writer_type = @TypeOf(alt_writer);
     const writer_info = @typeInfo(writer_type);
 
@@ -239,6 +254,14 @@ pub fn send(node: *Node, msg: Message, alt_writer: anytype) !void {
         alt_writer
     else
         node.writer();
+
+    node.setReplyTo(msg);
+
+    // debug shit!
+    // log.info(
+    //     "Sending out '{s}' message, in_reply_to: {d}, msg_id: {d}",
+    //     .{ msg.get("type").?.String, msg.get("in_reply_to").?.Integer, msg.get("msg_id").?.Integer },
+    // );
 
     msg.json(std_out) catch |err| {
         log.err("could not write json out: {}", .{err});
@@ -257,6 +280,7 @@ pub fn broadcast(node: *Node, msg: *Message, ids: []const []const u8) !void {
     const std_out = node.writer();
     for (ids) |id| {
         msg.dest = id;
+        msg.setReplyTo(msg);
         msg.json(std_out) catch |err| {
             log.err("could not write json out: {}", .{err});
             return;
@@ -369,8 +393,14 @@ pub const Message = struct {
         return msg.body.Object.get(field);
     }
 
-    pub fn set(msg: *Self, key: []const u8, val: std.json.Value) !void {
-        return msg.body.Object.put(key, val);
+    /// set json value entry on the message body
+    pub fn set(msg: *Self, field: []const u8, val: std.json.Value) !void {
+        return msg.body.Object.put(field, val);
+    }
+
+    /// remove json value entry from the message body
+    pub fn remove(msg: *Self, field: []const u8) bool {
+        return msg.body.Object.swapRemove(field);
     }
 
     // get the body type of a message
@@ -385,8 +415,6 @@ pub const Message = struct {
     /// you free when the request processing is done.
     pub fn decode(allocator: Allocator, bytes: []const u8, copy: bool) !Self {
         var parser = std.json.Parser.init(allocator, copy);
-
-        // log.err("got json bytes: {s}", .{bytes});
 
         var tree = parser.parse(bytes) catch |err| {
             log.err("failed to parse message: {}", .{err});
