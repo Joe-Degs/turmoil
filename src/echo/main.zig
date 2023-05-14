@@ -14,20 +14,9 @@ pub fn main() !void {
     };
 }
 
-pub fn echoHandler(node: *Node, msg: *Message) error{InvalidRequest}!void {
+pub fn echoHandler(node: *Node, msg: *Message) !void {
     msg.set("type", .{ .String = "echo_ok" }) catch unreachable;
-    const msg_id = msg.get("msg_id").?.Integer;
-
-    msg.set(
-        "in_reply_to",
-        .{ .Integer = msg_id },
-    ) catch unreachable;
-
-    msg.set("msg_id", .{
-        .Integer = @intCast(i64, node.msg_id()),
-    }) catch unreachable;
-
     msg.dest = msg.src;
     msg.src = node.id;
-    try node.send(msg.*, null);
+    try node.send(msg, null);
 }

@@ -39,21 +39,10 @@ pub const Echo = struct {
         const self = getSelf(ctx);
 
         msg.set("type", .{ .String = "echo_ok" }) catch unreachable;
-        const msg_id = msg.get("msg_id").?.Integer;
-
-        msg.set(
-            "in_reply_to",
-            .{ .Integer = msg_id },
-        ) catch unreachable;
-
-        msg.set("msg_id", .{
-            .Integer = @intCast(i64, self.node.msg_id()),
-        }) catch unreachable;
-
         msg.dest = msg.src;
         msg.src = self.node.id;
 
-        self.node.send(msg.*, null) catch unreachable;
+        self.node.send(msg, null) catch unreachable;
     }
 
     fn service(self: *Echo) Service {
