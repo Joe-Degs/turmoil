@@ -5,28 +5,39 @@ const Message = Node.Message;
 const Service = Node.Service;
 const State = Node.State;
 
+const log = std.log.scoped(.Bcast);
+
 pub fn main() !void {
     var node = try Node.init(std.heap.page_allocator);
     defer node.deinit();
 
-    var bcast = try Bcast.init(std.heap.page_allocator);
+    var bcast = Bcast.init(std.heap.page_allocator);
+    defer bcast.deinit();
+
     try node.registerService("broadcast read topology", bcast.service());
 
-    node.run(null, null) catch {
+    node.run(null, null) catch |err| {
+        log.err("node died with err: {}", .{err});
         std.os.exit(1);
     };
 }
 
 pub const Bcast = struct {
     node: *Node = undefined,
+    allocator: std.mem.Allocator,
     status: State = .uninitialized,
     messages: std.ArrayList(std.json.Value) = undefined,
 
-    pub fn init(allocator: std.mem.Allocator) !*Bcast {
-        return &.{
+    pub fn init(allocator: std.mem.Allocator) Bcast {
+        return Bcast{
+            .allocator = allocator,
             .messages = std.ArrayList(std.json.Value).init(allocator),
             .status = .initialized,
         };
+    }
+
+    pub fn deinit(self: *Bcast) void {
+        self.messages.deinit();
     }
 
     fn getSelf(ctx: *anyopaque) *Bcast {
@@ -36,6 +47,7 @@ pub const Bcast = struct {
     fn start(ctx: *anyopaque, n: *Node) void {
         const self = getSelf(ctx);
         self.node = n;
+        self.status = .running;
     }
 
     fn state(ctx: *anyopaque) State {
@@ -43,8 +55,8 @@ pub const Bcast = struct {
     }
 
     pub fn handle_bcast(self: *Bcast, msg: *Message) !void {
-        const message = msg.get("message").?;
-        try self.messages.append(message);
+        const message = msg.get("message").?.Integer;
+        try self.messages.append(.{ .Integer = message });
 
         msg.set("type", .{ .String = "broadcast_ok" }) catch unreachable;
         _ = msg.remove("message");
@@ -64,7 +76,6 @@ pub const Bcast = struct {
 
         msg.set("type", .{ .String = "topology_ok" }) catch unreachable;
         _ = msg.remove("topology");
-        return;
     }
 
     fn handle(ctx: *anyopaque, msg: *Message) void {
@@ -81,7 +92,10 @@ pub const Bcast = struct {
 
         msg.dest = msg.src;
         msg.src = self.node.id;
-        self.node.send(msg, null) catch unreachable;
+        self.node.send(msg, null) catch |err| {
+            log.err("could not send out message: {}", .{err});
+            unreachable;
+        };
     }
 
     pub fn service(self: *Bcast) Service {
