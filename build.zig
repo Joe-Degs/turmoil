@@ -58,6 +58,12 @@ pub fn build(b: *std.Build) void {
             .workload = "broadcast",
             .args = &[_][]const u8{ "--node-count", "1", "--time-limit", "20", "--rate", "10" },
         },
+        .{
+            .name = "broadcast-b",
+            .description = "fly.io/dist-sys multi-node node broadcast accross a cluster with no partitions",
+            .workload = "broadcast",
+            .args = &[_][]const u8{ "--node-count", "5", "--time-limit", "20", "--rate", "10" },
+        },
     };
 
     const node_module = b.addModule("Node", .{
