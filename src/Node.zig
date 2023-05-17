@@ -42,23 +42,29 @@ arena: std.heap.ArenaAllocator = undefined,
 /// unique string identifer used to route messages to and from the node
 id: []u8 = &[_]u8{},
 
-// the id of the next message that goes out of this node
+// temp buffer for storing bytes recieved from the network
+buf: []u8 = &[_]u8{},
+
+/// msg_id of the next message that gets sent out from the node
 next_id: usize = 1,
 
-/// ids of maelstrom internal clients, they send messages to nodes and expect
-/// responses back.
+/// ids of maelstrom client/nodes in the network, they send messages to nodes and expect
+/// responses back just like you. they are a node's peers in the network.
 node_ids: std.ArrayList([]const u8) = undefined,
 
-/// handlers for messages
+/// handlers are standalone functions that can process a message and send a response
+/// they are always run synchronously
 handlers: std.StringHashMap(Method) = undefined,
 
-/// services
+/// services are handlers but keep their own state and can run concurrently
+/// with other node processes (though they are not doing that now).
+/// It is also an interface with `handle`, `state`, `start` functions.
 services: std.StringHashMap(Service) = undefined,
 
-/// t
+/// the current state of a node
 status: State = .uninitialized,
 
-/// STDOUT and STDIN streams for sending and receiving message in the network.
+/// STDOUT and STDIN streams for sending and receiving message in the maelstrom network.
 stdin: io.BufferedReader(4096, @TypeOf(in)) = io.bufferedReader(in),
 stdout: io.BufferedWriter(4096, @TypeOf(out)) = io.bufferedWriter(out),
 
@@ -68,34 +74,54 @@ pub fn init(allocator: Allocator) !*Node {
     const node = try allocator.create(Node);
     node.* = Node{
         .allocator = allocator,
+        .buf = try allocator.alloc(u8, 1024),
+        .arena = std.heap.ArenaAllocator.init(allocator),
         .node_ids = std.ArrayList([]const u8).init(allocator),
+
+        // TODO(joe): consider not initialzing the hash maps until there is
+        // something to register
         .handlers = std.StringHashMap(Method).init(allocator),
         .services = std.StringHashMap(Service).init(allocator),
-        .arena = std.heap.ArenaAllocator.init(allocator),
     };
     return node;
 }
 
 pub fn deinit(node: *Node) void {
-    // deallocate node.id if its initialized
+    // deallocate some buffers
     if (node.id.len > 0) node.allocator.free(node.id);
+    if (node.buf.len > 0) node.allocator.free(node.buf);
+
     node.node_ids.deinit();
     node.handlers.deinit();
     node.services.deinit();
 
-    // not soo sure about this one but we keep it for now
-    if (node.arena.queryCapacity() > 0) node.arena.deinit();
+    node.arena.deinit();
+
+    // now we obliterate the node itself
     node.allocator.destroy(node);
 }
 
+/// get the next msg_id from the node, can be called concurrently.
 pub fn msg_id(node: *Node) usize {
     return @atomicRmw(usize, &node.next_id, .Add, 1, .Monotonic);
 }
 
-/// register a method for handling a specific kind of message that flows through
-/// the node.
+/// register a method to handle a specific type of message
 pub fn registerMethod(node: *Node, typ: []const u8, method: Method) !void {
     return node.handlers.put(typ, method);
+}
+
+/// register a service for handling a group of messages. `types` is a concatenation
+/// of all the types of messages that can be handled by the the service
+///
+/// eg:  to register a service named `send_back` that can handle an echo, broadcast
+///      and topology messages do:
+///
+///         `try node.registerService("echo/broadcast/topology", send_back);`
+///
+///     the separators can be anything or nothing
+pub fn registerService(node: *Node, types: []const u8, service: Service) !void {
+    return node.services.put(types, service);
 }
 
 /// get stdout as a buffered write stream
@@ -114,6 +140,8 @@ pub fn flush(node: *Node) !void {
 }
 
 /// wait and listen for messages on the network and delegate handlers to handle them.
+/// this is the run loop of the node, it starts the functions that waits and reads
+/// from the network and sends it off for processing.
 pub fn run(node: *Node, alt_reader: anytype, alt_writer: anytype) !void {
     while (true) {
         if (node.status == .shutdown) return;
@@ -130,11 +158,12 @@ pub fn run(node: *Node, alt_reader: anytype, alt_writer: anytype) !void {
     }
 }
 
+/// runOnce waits patiently for messages from client/peers in the network and
+/// decides where to send them.
 pub fn runOnce(node: *Node, alloc: ?Allocator, alt_reader: anytype, alt_writer: anytype) !void {
     const std_in = if ((@typeInfo(@TypeOf(alt_reader)) != .Null) and
         @hasDecl(@TypeOf(alt_reader), "read")) alt_reader else node.reader();
 
-    var buf: [512]u8 = undefined;
     if (node.status == .shutdown) {
         log.info("node is down!", .{});
         return;
@@ -142,13 +171,14 @@ pub fn runOnce(node: *Node, alloc: ?Allocator, alt_reader: anytype, alt_writer: 
 
     var allocator = alloc orelse node.arena.allocator();
 
-    const bytes = std_in.readUntilDelimiter(&buf, '\n') catch |err| switch (err) {
+    const bytes = std_in.readUntilDelimiter(node.buf, '\n') catch |err| switch (err) {
         error.EndOfStream, error.OperationAborted => return,
         else => {
             log.err("failed to read json stream: {}", .{err});
             return;
         },
     };
+
     log.info("recieved message: {s}", .{bytes});
 
     var msg = try Message.decode(allocator, bytes, true);
@@ -192,7 +222,7 @@ pub fn runOnce(node: *Node, alloc: ?Allocator, alt_reader: anytype, alt_writer: 
     };
 
     const service_state = service.state();
-    if (service_state == .running or service_state == .initialized) {
+    if (service_state == .running or service_state == .stopped) {
         service.handle(&msg);
     } else {
         service.start(node);
@@ -231,8 +261,7 @@ fn handleInitMessage(node: *Node, msg: *Message, alt_writer: anytype) !void {
     try node.send(msg, alt_writer);
 }
 
-/// set the messages in_reply_to and msg_id to the appropriate values before
-/// sending out
+/// set the message's `in_reply_to` and `msg_id` fields to the appropriate values
 pub fn setReplyTo(node: *Node, msg: *Message) void {
     msg.set(
         "in_reply_to",
@@ -276,11 +305,15 @@ pub fn send(node: *Node, msg: *Message, alt_writer: anytype) !void {
     if (writer_info == .Null) node.flush() catch return;
 }
 
+/// experimental method for sending messages to a bunch of nodes in the network
 pub fn broadcast(node: *Node, msg: *Message, ids: []const []const u8) !void {
     const std_out = node.writer();
+
+    msg.src = node.id;
+
     for (ids) |id| {
         msg.dest = id;
-        msg.setReplyTo(msg);
+        // node.setReplyTo(msg);
         msg.json(std_out) catch |err| {
             log.err("could not write json out: {}", .{err});
             return;
@@ -288,10 +321,6 @@ pub fn broadcast(node: *Node, msg: *Message, ids: []const []const u8) !void {
         _ = std_out.write("\n") catch return;
     }
     node.flush() catch return;
-}
-
-pub fn registerService(node: *Node, types: []const u8, service: Service) !void {
-    return node.services.put(types, service);
 }
 
 /// services handle a specific workload. They keep their own state and can be
@@ -308,7 +337,7 @@ pub const Service = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// this is the run loop of the service.
+        /// initialize the service
         start: *const fn (ctx: *anyopaque, n: *Node) void,
 
         /// handle
@@ -323,7 +352,7 @@ pub const Service = struct {
 
     /// TODO(joe): figure out how to start the node independently
     pub fn start(self: Service, n: *Node) void {
-        self.vtable.start(self.ptr, n);
+        return self.vtable.start(self.ptr, n);
         // var thread = try std.Thread.spawn(
         //     .{},
         //     self.vtable.start,
@@ -333,7 +362,7 @@ pub const Service = struct {
     }
 
     pub fn handle(self: Service, m: *Message) void {
-        self.vtable.handle(self.ptr, m);
+        return self.vtable.handle(self.ptr, m);
     }
 
     pub fn state(self: Service) State {
