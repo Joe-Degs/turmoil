@@ -2,3 +2,4 @@ maelstrom
 zig-out
 zig-cache
 store
+new/*

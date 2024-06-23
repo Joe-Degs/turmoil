@@ -15,7 +15,7 @@ pub fn main() !void {
 }
 
 pub fn echoHandler(node: *Node, msg: *Message) !void {
-    msg.set("type", .{ .String = "echo_ok" }) catch unreachable;
+    msg.set("type", .{ .string = "echo_ok" }) catch unreachable;
     msg.dest = msg.src;
     msg.src = node.id;
     try node.send(msg, null);

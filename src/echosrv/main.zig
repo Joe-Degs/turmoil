@@ -26,9 +26,8 @@ pub const Echo = struct {
 
     fn start(ctx: *anyopaque, n: *Node) void {
         const self = getSelf(ctx);
-
         self.node = n;
-        self.status = .running;
+        self.status = .active;
     }
 
     fn state(ctx: *anyopaque) State {
@@ -37,11 +36,9 @@ pub const Echo = struct {
 
     fn handle(ctx: *anyopaque, msg: *Message) void {
         const self = getSelf(ctx);
-
-        msg.set("type", .{ .String = "echo_ok" }) catch unreachable;
+        msg.set("type", .{ .string = "echo_ok" }) catch unreachable;
         msg.dest = msg.src;
         msg.src = self.node.id;
-
         self.node.send(msg, null) catch unreachable;
     }
 

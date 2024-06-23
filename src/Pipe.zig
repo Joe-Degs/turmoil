@@ -15,50 +15,18 @@ buf: []u8,
 wr_idx: usize = 0,
 rd_idx: usize = 0,
 
-fn mask(self: Self, idx: usize) usize {
-    return idx % self.buf.len;
-}
-
-fn mask2(self: Self, idx: usize) usize {
-    return idx % (2 * self.buf.len);
-}
-
-fn len(self: Self) usize {
-    const wrap_offset = 2 * self.buf.len * @boolToInt(self.wr_idx < self.rd_idx);
-    const adjusted_wr_idx = self.wr_idx + wrap_offset;
-    return adjusted_wr_idx - self.rd_idx;
-}
-
 /// read from the underlying buffer
 pub fn read(self: *Self, dest: []u8) Error!usize {
     self.mu.lock();
     defer self.mu.unlock();
-
-    if (dest.len == 0) return 0;
-    var n: usize = 0;
-    if (self.wr_idx == self.rd_idx) return Error.EndOfStream;
-    for (dest) |*d| {
-        d.* = self.buf[self.mask(self.rd_idx)];
-        self.rd_idx = self.mask2(self.rd_idx + 1);
-        n += 1;
-    }
-    return n;
+    _ = dest;
 }
 
 /// write to the underlying buffer
 pub fn write(self: *Self, bytes: []const u8) Error!usize {
     self.mu.lock();
     defer self.mu.unlock();
-
-    if (bytes.len == 0) return 0;
-    if (self.len() + bytes.len > self.buf.len) return error.OperationAborted;
-    var n: usize = 0;
-    for (bytes) |b| {
-        self.buf[self.mask(self.wr_idx)] = b;
-        self.wr_idx = self.mask2(self.wr_idx + 1);
-        n += 1;
-    }
-    return n;
+    _ = bytes;
 }
 
 const Reader = io.Reader(*Self, Error, read);

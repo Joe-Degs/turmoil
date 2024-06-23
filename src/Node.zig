@@ -17,8 +17,8 @@ pub const State = enum {
     /// node has recieved an `init` request and has been initialized
     initialized,
 
-    /// node/service is running and accepting requests
-    running,
+    /// node/service is active and accepting requests
+    active,
 
     /// service has stopped, can recieve requests but won't process them
     stopped,
@@ -181,7 +181,7 @@ pub fn runOnce(node: *Node, alloc: ?Allocator, alt_reader: anytype, alt_writer: 
 
     log.info("recieved message: {s}", .{bytes});
 
-    var msg = try Message.decode(allocator, bytes, true);
+    var msg = try Message.decode(allocator, bytes);
     const msg_type = msg.getType();
 
     // handle init message
@@ -222,7 +222,7 @@ pub fn runOnce(node: *Node, alloc: ?Allocator, alt_reader: anytype, alt_writer: 
     };
 
     const service_state = service.state();
-    if (service_state == .running or service_state == .stopped) {
+    if (service_state == .active or service_state == .stopped) {
         service.handle(&msg);
     } else {
         service.start(node);
@@ -233,18 +233,18 @@ pub fn runOnce(node: *Node, alloc: ?Allocator, alt_reader: anytype, alt_writer: 
 /// initialize node for participating in the network
 fn handleInitMessage(node: *Node, msg: *Message, alt_writer: anytype) !void {
     // set the node id
-    const id = msg.get("node_id").?.String;
+    const id = msg.get("node_id").?.string;
     node.id = try node.allocator.alloc(u8, id.len);
-    @memcpy(node.id.ptr, id.ptr, id.len);
+    @memcpy(node.id, id);
 
     // then add the node ids of peers in the network
-    const node_ids = msg.get("node_ids").?.Array;
-    for (node_ids.items) |node_id| try node.node_ids.append(node_id.String);
+    const node_ids = msg.get("node_ids").?.array;
+    for (node_ids.items) |node_id| try node.node_ids.append(node_id.string);
 
     assert(msg.remove("node_ids"));
     assert(msg.remove("node_id"));
 
-    msg.set("type", .{ .String = "init_ok" }) catch unreachable;
+    msg.set("type", .{ .string = "init_ok" }) catch unreachable;
     msg.dest = msg.src;
     msg.src = node.id;
 
@@ -268,9 +268,7 @@ pub fn setReplyTo(node: *Node, msg: *Message) void {
         msg.get("msg_id").?,
     ) catch unreachable;
 
-    msg.set("msg_id", .{
-        .Integer = @intCast(i64, node.msg_id()),
-    }) catch unreachable;
+    msg.set("msg_id", .{ .integer = @intCast(node.msg_id()) }) catch unreachable;
 }
 
 /// send message into the network.
@@ -373,7 +371,7 @@ pub const Service = struct {
 /// given a generic type and a type erased pointer to that type,
 /// return a pointer that is properly aligned to the type
 pub fn alignCastPtr(comptime T: type, ctx: *anyopaque) *T {
-    return @ptrCast(*T, @alignCast(@alignOf(T), ctx));
+    return @ptrCast(@alignCast(ctx));
 }
 
 /// Messages are json objects routed between different nodes participating in the
@@ -388,53 +386,24 @@ pub const Message = struct {
     /// is contains the data that the handlers need to do stuff.
     body: std.json.Value,
 
-    /// make a message out of a parsed tree of json values
-    /// It throws an invalid message error
-    pub fn fromValueTree(tree: std.json.ValueTree) error{InvalidMessage}!Self {
-        if (tree.root != .Object) return error.InvalidMessage;
-        const object = tree.root.Object;
-
-        // i'm pretty sure the body of the message is not optional so we check
-        const body = if (object.get("body")) |obj| blk: {
-            break :blk switch (obj) {
-                .Object => obj,
-                else => return error.InvalidMessage,
-            };
-        } else return error.InvalidMessage;
-
-        assert(@TypeOf(body) == std.json.Value);
-
-        return .{
-            .src = switch (object.get("src") orelse return error.InvalidMessage) {
-                .String => |str| str,
-                else => null,
-            },
-            .dest = switch (object.get("dest") orelse return error.InvalidMessage) {
-                .String => |str| str,
-                else => null,
-            },
-            .body = body,
-        };
-    }
-
     // get a specific field of the message's body
     pub fn get(msg: Self, field: []const u8) ?std.json.Value {
-        return msg.body.Object.get(field);
+        return msg.body.object.get(field);
     }
 
     /// set json value entry on the message body
     pub fn set(msg: *Self, field: []const u8, val: std.json.Value) !void {
-        return msg.body.Object.put(field, val);
+        return msg.body.object.put(field, val);
     }
 
     /// remove json value entry from the message body
     pub fn remove(msg: *Self, field: []const u8) bool {
-        return msg.body.Object.swapRemove(field);
+        return msg.body.object.swapRemove(field);
     }
 
     // get the body type of a message
     pub fn getType(msg: Self) []const u8 {
-        return msg.get("type").?.String;
+        return msg.get("type").?.string;
     }
 
     /// decodeMessage unmarshals a json string into a message object, it allocate's
@@ -442,15 +411,11 @@ pub const Message = struct {
     ///
     /// I'll recommend an arena allocator that pass in when a request comes in and that
     /// you free when the request processing is done.
-    pub fn decode(allocator: Allocator, bytes: []const u8, copy: bool) !Self {
-        var parser = std.json.Parser.init(allocator, copy);
-
-        var tree = parser.parse(bytes) catch |err| {
+    pub fn decode(allocator: Allocator, bytes: []const u8) !Self {
+        return std.json.parseFromSliceLeaky(Message, allocator, bytes, .{ .ignore_unknown_fields = true }) catch |err| {
             log.err("failed to parse message: {}", .{err});
             return err;
         };
-
-        return Self.fromValueTree(tree);
     }
 
     // create a message from individual values that make up that message. The
@@ -513,7 +478,7 @@ test "message from json string" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
-    const msg_obj = try Message.decode(arena.allocator(), msg, false);
+    const msg_obj = try Message.decode(arena.allocator(), msg);
     try testing.expect(std.mem.eql(u8, "n1", msg_obj.src.?));
     try testing.expect(std.mem.eql(u8, "c1", msg_obj.dest.?));
 
@@ -558,9 +523,9 @@ test "message from body struct" {
     try testing.expect(std.mem.eql(u8, body.type, msg.getType()));
     try testing.expect(msg.get("done").?.Bool == body.done);
 
-    const msg_ids = msg.get("node_ids").?.Array;
+    const msg_ids = msg.get("node_ids").?.array;
     for (body.node_ids, msg_ids.items) |exp, val|
-        try testing.expect(std.mem.eql(u8, exp, val.String));
+        try testing.expect(std.mem.eql(u8, exp, val.string));
 }
 
 // let's use this whacky pipe to tunnel messages from test to node
@@ -612,7 +577,7 @@ const Simulator = struct {
                 },
             };
 
-            return Message.decode(allocator, bytes, true) catch unreachable;
+            return Message.decode(allocator, bytes) catch unreachable;
         }
         return null;
     }
@@ -663,7 +628,7 @@ test "node - init message exchange (single thread)" {
     // read out the response
     var msg = sim.read(arena.allocator()) orelse unreachable;
     try testing.expect(std.mem.eql(u8, msg.getType(), "init_ok"));
-    try testing.expect(msg.get("in_reply_to").?.Integer == init_body.msg_id);
+    try testing.expect(msg.get("in_reply_to").?.integer == init_body.msg_id);
     // TODO(joe): assert that the other values are correctly parsed
 
     // send shutdown message
