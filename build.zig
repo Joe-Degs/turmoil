@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) void {
 
     // Creates a step for unit testing.
     const main_tests = b.addTest(.{
-        .root_source_file = .{ .path = b.pathJoin(&.{ "src", "main.zig" }) },
+        .root_source_file = b.path(b.pathJoin(&.{ "src", "main.zig" })),
         .target = target,
         .optimize = optimize,
     });
@@ -19,8 +19,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&main_tests.step);
 
     const node_module = b.addModule("Node", .{
-        .source_file = .{ .path = b.pathJoin(&.{ "src", "Node.zig" }) },
+        .root_source_file = b.path(b.pathJoin(&.{ "src", "Node.zig" })),
     });
+    const ziglangSet = b.dependency("ziglangSet", .{});
 
     const run_step = b.step("run", "Run maelstrom test for challenge");
 
@@ -29,13 +30,12 @@ pub fn build(b: *std.Build) void {
         // build the challenge binary
         const cbin = b.addExecutable(.{
             .name = challenge.name,
-            .root_source_file = .{
-                .path = b.pathJoin(&.{ "src", challenge.name, "main.zig" }),
-            },
+            .root_source_file = b.path(b.pathJoin(&.{ "src", challenge.name, "main.zig" })),
             .target = target,
             .optimize = optimize,
         });
-        cbin.addModule("Node", node_module);
+        cbin.root_module.addImport("Node", node_module);
+        cbin.root_module.addImport("Set", ziglangSet.module("ziglangSet"));
 
         if (build_all) {
             b.installArtifact(cbin);
@@ -72,31 +72,37 @@ const challenges = [_]struct {
     args: []const []const u8, // extra arguments for maelstrom
 }{
     .{
-        .name = "echo",
+        .name = "1a",
         .description = "send the given stream of bytes back into the ether; fly.io/dist-sys",
         .workload = "echo",
         .args = &[_][]const u8{ "--node-count", "1", "--time-limit", "10" },
     },
     .{
-        .name = "echosrv",
+        .name = "1a",
         .description = "send the given stream of bytes back into the ether but with a node service; fly.io/dist-sys",
         .workload = "echo",
         .args = &[_][]const u8{ "--node-count", "1", "--time-limit", "10" },
     },
     .{
-        .name = "unique-ids",
+        .name = "2a",
         .description = "globally-unique ID generator; fly.io/dist-sys",
         .workload = "unique-ids",
-        .args = &[_][]const u8{ "--time-limit", "30", "--rate", "1000", "--node-count", "3", "--time-limit", "10", "--availability", "total", "--nemesis", "partition" },
+        .args = &[_][]const u8{ "--time-limit", "30", "--rate", "1000", "--node-count", "3", "--availability", "total", "--nemesis", "partition" },
     },
     .{
-        .name = "broadcasta",
+        .name = "2b",
+        .description = "globally-unique ID generator; fly.io/dist-sys",
+        .workload = "unique-ids",
+        .args = &[_][]const u8{ "--time-limit", "60", "--rate", "100000", "--node-count", "10", "--availability", "total", "--nemesis", "partition" },
+    },
+    .{
+        .name = "3a",
         .description = "gossip messages between all nodes in the system; fly.io/dist-sys",
         .workload = "broadcast",
         .args = &[_][]const u8{ "--node-count", "1", "--time-limit", "20", "--rate", "10" },
     },
     .{
-        .name = "broadcastb",
+        .name = "3b",
         .description = "multi-node node broadcast accross a cluster with no partitions; fly.io/dist-sys",
         .workload = "broadcast",
         .args = &[_][]const u8{ "--node-count", "5", "--time-limit", "20", "--rate", "10" },

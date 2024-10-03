@@ -10,7 +10,7 @@ pub fn main() !void {
     try node.registerMethod("echo", echoHandler);
 
     node.run(null, null) catch {
-        std.os.exit(1);
+        std.posix.exit(1);
     };
 }
 

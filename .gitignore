@@ -1,5 +1,5 @@
-maelstrom
-zig-out
-zig-cache
+maelstrom/
+zig-out/
+.zig-cache/
 store
-new/*
+new/

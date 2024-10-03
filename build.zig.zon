@@ -1,0 +1,15 @@
+.{
+    .name = "turmoil",
+    .version = "0.0.1",
+    .dependencies = .{
+        .ziglangSet = .{
+            .url = "https://github.com/deckarep/ziglang-set/archive/fc2aa4360fb4441c562a5095b7d8a347f0a106b5.tar.gz",
+            .hash = "1220c4600b6a431a46c3b5eac0630c8aa7cd63e3493886bb785b6d3cb4a5f507852e",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

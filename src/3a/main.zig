@@ -8,17 +8,25 @@ const State = Node.State;
 const log = std.log.scoped(.Bcast);
 
 pub fn main() !void {
-    var node = try Node.init(std.heap.page_allocator);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var node = try Node.init(allocator);
     defer node.deinit();
 
-    var bcast = Bcast.init(std.heap.page_allocator);
+    var bcast = Bcast.init(allocator);
     defer bcast.deinit();
 
+    // i'd like to do something like
+    // try node.register(enum { broadcast, read, topology}, bcast.service())
+    // and then when a message comes out of the socket it has its message type
+    // as an enum instead of a string so that we can switch on that.
     try node.registerService("broadcast read topology", bcast.service());
 
     node.run(null, null) catch |err| {
         log.err("node died with err: {}", .{err});
-        std.os.exit(1);
+        std.posix.exit(1);
     };
 }
 
@@ -27,13 +35,11 @@ pub const Bcast = struct {
     allocator: std.mem.Allocator,
     status: State = .uninitialized,
     messages: std.ArrayList(std.json.Value) = undefined,
-    broadcast_ids: std.ArrayList([]const u8) = undefined,
 
     pub fn init(allocator: std.mem.Allocator) Bcast {
         return Bcast{
             .allocator = allocator,
             .messages = std.ArrayList(std.json.Value).init(allocator),
-            .broadcast_ids = std.ArrayList([]const u8).init(allocator),
             .status = .initialized,
         };
     }
@@ -46,42 +52,37 @@ pub const Bcast = struct {
         return Node.alignCastPtr(Bcast, ctx);
     }
 
-    fn start(ctx: *anyopaque, n: *Node) void {
+    pub fn start(ctx: *anyopaque, n: *Node) void {
         const self = getSelf(ctx);
         self.node = n;
-        self.status = .running;
+        // self.status = .running;
     }
 
-    fn state(ctx: *anyopaque) State {
+    pub fn state(ctx: *anyopaque) State {
         return getSelf(ctx).status;
     }
 
-    pub fn handle_bcast(self: *Bcast, msg: *Message) !void {
-        const msg_src = msg.src;
+    fn handle_bcast(self: *Bcast, msg: *Message) !void {
+        const message = msg.get("message").?.integer;
+        try self.messages.append(.{ .integer = message });
 
-        try self.node.broadcast(msg, self.broadcast_ids.items);
-
-        msg.src = msg_src;
-        const message = msg.get("message").?.Integer;
-        try self.messages.append(.{ .Integer = message });
-
-        msg.set("type", .{ .String = "broadcast_ok" }) catch unreachable;
+        msg.set("type", .{ .string = "broadcast_ok" }) catch unreachable;
         _ = msg.remove("message");
     }
 
     pub fn handle_read(self: *Bcast, msg: *Message) void {
-        msg.set("type", .{ .String = "read_ok" }) catch unreachable;
+        msg.set("type", .{ .string = "read_ok" }) catch unreachable;
         msg.set(
             "messages",
-            .{ .Array = self.messages },
+            .{ .array = self.messages },
         ) catch unreachable;
     }
 
-    pub fn handle_topology(self: *Bcast, msg: *Message) !void {
-        const ids = msg.get("topology").?.Object.get(self.node.id).?.Array;
-        for (ids.items) |id| try self.broadcast_ids.append(id.String);
+    pub fn handle_topology(self: *Bcast, msg: *Message) void {
+        _ = self;
+        _ = msg.get("topology");
 
-        msg.set("type", .{ .String = "topology_ok" }) catch unreachable;
+        msg.set("type", .{ .string = "topology_ok" }) catch unreachable;
         _ = msg.remove("topology");
     }
 
@@ -89,12 +90,14 @@ pub const Bcast = struct {
         const self = getSelf(ctx);
         const msg_type = msg.getType();
 
-        if (std.mem.eql(u8, msg_type, "broadcast")) {
-            self.handle_bcast(msg) catch unreachable;
-        } else if (std.mem.eql(u8, msg_type, "read")) {
-            self.handle_read(msg);
-        } else if (std.mem.eql(u8, msg_type, "topology")) {
-            self.handle_topology(msg) catch unreachable;
+        const msg_types = enum { broadcast, read, topology };
+
+        switch (std.meta.stringToEnum(msg_types, msg_type) orelse unreachable) {
+            .broadcast => self.handle_bcast(msg) catch |err| {
+                log.err("failed to read: {}", .{err});
+            },
+            .read => self.handle_read(msg),
+            .topology => self.handle_topology(msg),
         }
 
         msg.dest = msg.src;

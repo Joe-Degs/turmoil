@@ -103,7 +103,7 @@ pub fn deinit(node: *Node) void {
 
 /// get the next msg_id from the node, can be called concurrently.
 pub fn msg_id(node: *Node) usize {
-    return @atomicRmw(usize, &node.next_id, .Add, 1, .Monotonic);
+    return @atomicRmw(usize, &node.next_id, .Add, 1, .monotonic);
 }
 
 /// register a method to handle a specific type of message
@@ -152,7 +152,7 @@ pub fn run(node: *Node, alt_reader: anytype, alt_writer: anytype) !void {
         // capacity for the next round.
         //
         // why don't we have GC's over here again?? :-/
-        if (@atomicLoad(usize, &node.next_id, .SeqCst) % 50 == 0) {
+        if (@atomicLoad(usize, &node.next_id, .seq_cst) % 50 == 0) {
             _ = node.arena.reset(.retain_capacity);
         }
     }
@@ -169,7 +169,7 @@ pub fn runOnce(node: *Node, alloc: ?Allocator, alt_reader: anytype, alt_writer: 
         return;
     }
 
-    var allocator = alloc orelse node.arena.allocator();
+    const allocator = alloc orelse node.arena.allocator();
 
     const bytes = std_in.readUntilDelimiter(node.buf, '\n') catch |err| switch (err) {
         error.EndOfStream, error.OperationAborted => return,
@@ -179,7 +179,7 @@ pub fn runOnce(node: *Node, alloc: ?Allocator, alt_reader: anytype, alt_writer: 
         },
     };
 
-    log.info("recieved message: {s}", .{bytes});
+    // log.info("recieved message: {s}", .{bytes});
 
     var msg = try Message.decode(allocator, bytes);
     const msg_type = msg.getType();
@@ -190,6 +190,7 @@ pub fn runOnce(node: *Node, alloc: ?Allocator, alt_reader: anytype, alt_writer: 
             log.err("failed to initialize node: {}", .{err});
             return err;
         };
+        log.info("successfully initialized node with id: {s}", .{node.id});
         return;
     } else if (std.mem.eql(u8, msg_type, "shutdown")) {
         node.status = .shutdown;
@@ -198,7 +199,7 @@ pub fn runOnce(node: *Node, alloc: ?Allocator, alt_reader: anytype, alt_writer: 
 
     // check if there is a handler for service
     han: {
-        var handler = node.handlers.get(msg_type) orelse break :han;
+        const handler = node.handlers.get(msg_type) orelse break :han;
 
         // TODO: better error handling for the handlers
         handler(node, &msg) catch |err| {
@@ -236,6 +237,7 @@ fn handleInitMessage(node: *Node, msg: *Message, alt_writer: anytype) !void {
     const id = msg.get("node_id").?.string;
     node.id = try node.allocator.alloc(u8, id.len);
     @memcpy(node.id, id);
+    node.status = .initialized;
 
     // then add the node ids of peers in the network
     const node_ids = msg.get("node_ids").?.array;
@@ -348,9 +350,24 @@ pub const Service = struct {
         // stop: *const fn state(ctx: *anyopaque) void,
     };
 
+    // work in progress stuff, it doesn't work and its not really what I want to achieve anyways.
+    // I am looking for a way to just pass the object and its type and then get the needed function
+    // pointers from it
+    pub fn initFromMethods(impl: anytype, start_fn: anytype, handle_fn: anytype, state_fn: anytype) Service {
+        return .{
+            .ptr = @ptrCast(impl),
+            .vtable = &.{
+                .start = @ptrCast(start_fn),
+                .handle = @ptrCast(handle_fn),
+                .state = @ptrCast(state_fn),
+            },
+        };
+    }
+
     /// TODO(joe): figure out how to start the node independently
     pub fn start(self: Service, n: *Node) void {
         return self.vtable.start(self.ptr, n);
+
         // var thread = try std.Thread.spawn(
         //     .{},
         //     self.vtable.start,
@@ -441,7 +458,7 @@ pub const Message = struct {
         const payload = buffer_stream.getWritten();
 
         var parser = std.json.Parser.init(allocator, true);
-        var tree = parser.parse(payload) catch |err| {
+        const tree = parser.parse(payload) catch |err| {
             log.err("failed to parse body: {}", .{err});
             return err;
         };
