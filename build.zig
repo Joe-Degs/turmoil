@@ -3,11 +3,11 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
 
-    const optimize = b.standardOptimizeOption(.{});
+    const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast });
 
     // add option to build all binaries in the project
     const build_all = b.option(bool, "all", "Build all challenges in project. Cannot run challenge if this option is set") orelse false;
-    const challenge_name = b.option([]const u8, "challenge", "Build a specific challenge. Available challenges: " ++ comptime challengeNames()) orelse "";
+    const challenge_name = b.option([]const u8, "src", "Build a specific challenge. Available challenges: " ++ comptime challengeNames()) orelse "";
 
     // Creates a step for unit testing.
     const main_tests = b.addTest(.{
@@ -15,8 +15,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const run_unit_step = b.addRunArtifact(main_tests);
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&main_tests.step);
+    test_step.dependOn(&run_unit_step.step);
 
     const node_module = b.addModule("Node", .{
         .root_source_file = b.path(b.pathJoin(&.{ "src", "Node.zig" })),
@@ -78,7 +79,7 @@ const challenges = [_]struct {
         .args = &[_][]const u8{ "--node-count", "1", "--time-limit", "10" },
     },
     .{
-        .name = "1a",
+        .name = "1b",
         .description = "send the given stream of bytes back into the ether but with a node service; fly.io/dist-sys",
         .workload = "echo",
         .args = &[_][]const u8{ "--node-count", "1", "--time-limit", "10" },
@@ -93,7 +94,7 @@ const challenges = [_]struct {
         .name = "2b",
         .description = "globally-unique ID generator; fly.io/dist-sys",
         .workload = "unique-ids",
-        .args = &[_][]const u8{ "--time-limit", "60", "--rate", "100000", "--node-count", "10", "--availability", "total", "--nemesis", "partition" },
+        .args = &[_][]const u8{ "--time-limit", "30", "--rate", "1000", "--node-count", "10", "--availability", "total", "--nemesis", "partition" },
     },
     .{
         .name = "3a",

@@ -5,7 +5,7 @@ const Message = Node.Message;
 const Service = Node.Service;
 const State = Node.State;
 
-const log = std.log.scoped(.UniqueIDGenerator);
+const log = std.log.scoped(.id_generator);
 
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -15,9 +15,10 @@ pub fn main() !void {
     defer node.deinit();
 
     var generator = UniqueIdGenerator.init(arena.allocator());
-    try node.registerService("generate", generator.service());
+    try node.services.append(generator.service());
 
-    node.run(null, null) catch {
+    node.run(null, null) catch |err| {
+        log.err("node {s}, failed while running with error: {}", .{ node.id, err });
         std.posix.exit(1);
     };
 }
@@ -29,6 +30,15 @@ pub const UniqueIdGenerator = struct {
     allocator: std.mem.Allocator,
     node_id: ?u32,
     counter: std.atomic.Value(u32),
+
+    const msg_set = Node.MessageSet.init(.{ .generate = true });
+
+    const Generate = struct {
+        type: []const u8,
+        msg_id: usize,
+        in_reply_to: ?usize = null,
+        id: ?u128 = null,
+    };
 
     fn init(allocator: std.mem.Allocator) UniqueIdGenerator {
         return UniqueIdGenerator{
@@ -52,15 +62,20 @@ pub const UniqueIdGenerator = struct {
         return getSelf(ctx).status;
     }
 
+    fn set(_: *anyopaque) Node.MessageSet {
+        return msg_set;
+    }
+
+    fn stop(_: *anyopaque) void {}
+
     fn getNodeIdNumber(self: *UniqueIdGenerator) !u32 {
         if (self.node_id == null and self.node.status != .uninitialized) {
-            log.info("getting node id for {s}", .{self.node.id});
             self.node_id = try std.fmt.parseUnsigned(u32, self.node.id[1..], 10);
         }
         return self.node_id orelse error.NodeNotInitialized;
     }
 
-    fn generatId(self: *UniqueIdGenerator) ![]u8 {
+    fn generatId(self: *UniqueIdGenerator, msg: Message(Generate)) !void {
         var current_time = std.time.milliTimestamp();
         var counter_value = self.counter.fetchAdd(1, .monotonic);
 
@@ -71,25 +86,20 @@ pub const UniqueIdGenerator = struct {
             }
             current_time = std.time.milliTimestamp();
         }
-        return std.fmt.allocPrint(self.allocator, "n{d}-{x}-{d}", .{
-            try self.getNodeIdNumber(),
-            current_time,
-            counter_value,
-        });
+
+        try self.node.reply(msg.into(Generate, .{
+            .type = "generate_ok",
+            .msg_id = self.node.nextId(),
+            .in_reply_to = msg.body.msg_id,
+            .id = (@as(u128, @intCast(current_time)) << 64) | (@as(u128, try self.getNodeIdNumber()) << 32) | counter_value,
+        }));
     }
 
-    fn handle(ctx: *anyopaque, msg: *Message) void {
+    fn handle(ctx: *anyopaque, msg: Message(std.json.Value)) void {
         const self = getSelf(ctx);
-        msg.set("type", .{ .string = "generate_ok" }) catch unreachable;
-        const unique_id = self.generatId() catch |err| {
-            log.err("failed to generate unique id: {}", .{err});
-            return;
+        self.generatId(msg.fromValue(Generate, self.allocator) catch unreachable) catch |err| {
+            log.err("failed while generating id: {}", .{err});
         };
-        defer self.allocator.free(unique_id);
-        msg.set("id", .{ .string = unique_id }) catch unreachable;
-        msg.dest = msg.src;
-        msg.src = self.node.id;
-        self.node.send(msg, null) catch unreachable;
     }
 
     fn service(self: *UniqueIdGenerator) Service {
@@ -99,6 +109,8 @@ pub const UniqueIdGenerator = struct {
                 .start = start,
                 .handle = handle,
                 .state = state,
+                .set = set,
+                .stop = stop,
             },
         };
     }

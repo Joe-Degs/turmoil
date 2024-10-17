@@ -4,21 +4,27 @@ const Message = Node.Message;
 const Service = Node.Service;
 const State = Node.State;
 
+const log = std.log.scoped(.echo);
+
 pub fn main() !void {
-    var node = try Node.init(std.heap.page_allocator);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    var node = try Node.init(arena.allocator());
     defer node.deinit();
 
     var echo: Echo = .{};
-    try node.registerService("echo|echo_ok", echo.service());
+    try node.services.append(echo.service());
 
     node.run(null, null) catch {
-        std.os.exit(1);
+        std.posix.exit(1);
     };
 }
 
 pub const Echo = struct {
     node: *Node = undefined,
     status: State = .uninitialized,
+    msg_set: Node.MessageSet = Node.MessageSet.init(.{ .echo = true }),
 
     fn getSelf(ctx: *anyopaque) *Echo {
         return Node.alignCastPtr(Echo, ctx);
@@ -34,12 +40,35 @@ pub const Echo = struct {
         return getSelf(ctx).status;
     }
 
-    fn handle(ctx: *anyopaque, msg: *Message) void {
-        const self = getSelf(ctx);
-        msg.set("type", .{ .string = "echo_ok" }) catch unreachable;
-        msg.dest = msg.src;
-        msg.src = self.node.id;
-        self.node.send(msg, null) catch unreachable;
+    fn stop(ctx: *anyopaque) void {
+        _ = ctx;
+    }
+
+    fn set(ctx: *anyopaque) Node.MessageSet {
+        return getSelf(ctx).msg_set;
+    }
+
+    const EchoMsg = struct {
+        type: []const u8,
+        msg_id: usize,
+        in_reply_to: ?usize = null,
+        echo: []const u8,
+    };
+
+    fn echo(self: Echo, msg: Message(std.json.Value)) !void {
+        const echo_res = msg.into(EchoMsg, .{
+            .type = "echo_ok",
+            .msg_id = self.node.nextId(),
+            .in_reply_to = @intCast(msg.body.object.get("msg_id").?.integer),
+            .echo = msg.body.object.get("echo").?.string,
+        });
+        try self.node.reply(echo_res);
+    }
+
+    fn handle(ctx: *anyopaque, msg: Message(std.json.Value)) void {
+        getSelf(ctx).echo(msg) catch |err| {
+            log.err("failed while handling request: {}", .{err});
+        };
     }
 
     fn service(self: *Echo) Service {
@@ -49,6 +78,8 @@ pub const Echo = struct {
                 .start = start,
                 .handle = handle,
                 .state = state,
+                .stop = stop,
+                .set = set,
             },
         };
     }

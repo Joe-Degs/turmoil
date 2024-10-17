@@ -18,11 +18,7 @@ pub fn main() !void {
     var bcast = Bcast.init(allocator);
     defer bcast.deinit();
 
-    // i'd like to do something like
-    // try node.register(enum { broadcast, read, topology}, bcast.service())
-    // and then when a message comes out of the socket it has its message type
-    // as an enum instead of a string so that we can switch on that.
-    try node.registerService("broadcast read topology", bcast.service());
+    try node.services.append(bcast.service());
 
     node.run(null, null) catch |err| {
         log.err("node died with err: {}", .{err});
@@ -30,16 +26,38 @@ pub fn main() !void {
     };
 }
 
+const Types = enum { read, broadcast, topology };
+
+const topology = struct {
+    type: []const u8,
+    msg_id: usize,
+    in_reply_to: ?usize = null,
+    topology: ?std.json.Value = null,
+};
+
+const broadcast = struct {
+    type: []const u8,
+    msg_id: usize,
+    in_reply_to: ?usize = null,
+    message: ?usize = null,
+};
+
+const read = struct { type: []const u8, msg_id: usize, in_reply_to: ?usize = null, messages: ?[]usize = null };
+
 pub const Bcast = struct {
     node: *Node = undefined,
     allocator: std.mem.Allocator,
+
     status: State = .uninitialized,
-    messages: std.ArrayList(std.json.Value) = undefined,
+    messages: std.ArrayList(usize) = undefined,
+    message_set: std.EnumSet(Types) = std.EnumSet(Types).initFull(),
+
+    thread: ?std.Thread = null,
 
     pub fn init(allocator: std.mem.Allocator) Bcast {
         return Bcast{
             .allocator = allocator,
-            .messages = std.ArrayList(std.json.Value).init(allocator),
+            .messages = std.ArrayList(usize).init(allocator),
             .status = .initialized,
         };
     }
@@ -48,64 +66,59 @@ pub const Bcast = struct {
         self.messages.deinit();
     }
 
-    fn getSelf(ctx: *anyopaque) *Bcast {
-        return Node.alignCastPtr(Bcast, ctx);
-    }
-
-    pub fn start(ctx: *anyopaque, n: *Node) void {
-        const self = getSelf(ctx);
-        self.node = n;
-        // self.status = .running;
-    }
-
-    pub fn state(ctx: *anyopaque) State {
-        return getSelf(ctx).status;
-    }
-
-    fn handle_bcast(self: *Bcast, msg: *Message) !void {
-        const message = msg.get("message").?.integer;
-        try self.messages.append(.{ .integer = message });
-
-        msg.set("type", .{ .string = "broadcast_ok" }) catch unreachable;
-        _ = msg.remove("message");
-    }
-
-    pub fn handle_read(self: *Bcast, msg: *Message) void {
-        msg.set("type", .{ .string = "read_ok" }) catch unreachable;
-        msg.set(
-            "messages",
-            .{ .array = self.messages },
-        ) catch unreachable;
-    }
-
-    pub fn handle_topology(self: *Bcast, msg: *Message) void {
-        _ = self;
-        _ = msg.get("topology");
-
-        msg.set("type", .{ .string = "topology_ok" }) catch unreachable;
-        _ = msg.remove("topology");
-    }
-
-    fn handle(ctx: *anyopaque, msg: *Message) void {
-        const self = getSelf(ctx);
-        const msg_type = msg.getType();
-
-        const msg_types = enum { broadcast, read, topology };
-
-        switch (std.meta.stringToEnum(msg_types, msg_type) orelse unreachable) {
-            .broadcast => self.handle_bcast(msg) catch |err| {
-                log.err("failed to read: {}", .{err});
-            },
-            .read => self.handle_read(msg),
-            .topology => self.handle_topology(msg),
-        }
-
-        msg.dest = msg.src;
-        msg.src = self.node.id;
-        self.node.send(msg, null) catch |err| {
-            log.err("could not send out message: {}", .{err});
-            unreachable;
+    fn reply(self: *Bcast, msg: anytype) void {
+        self.node.reply(msg) catch |err| {
+            log.err("failed to send reply: {}", .{err});
         };
+    }
+
+    fn handle(ctx: *anyopaque, msg: Message(std.json.Value)) void {
+        const self = getSelf(ctx);
+
+        switch (std.meta.stringToEnum(Types, msg.body.object.get("type").?.string) orelse return) {
+            .broadcast => {
+                const bcast_msg = msg.fromValue(broadcast, self.allocator) catch |err| {
+                    log.err("failed to destructure broadcast mesage: {}", .{err});
+                    return;
+                };
+                defer bcast_msg.deinit();
+                self.messages.append(bcast_msg.value.message.?) catch {
+                    log.err("failed to append to message log", .{});
+                    return;
+                };
+                self.reply(msg.into(broadcast, .{
+                    .type = "broadcast_ok",
+                    .msg_id = self.node.nextId(),
+                    .in_reply_to = bcast_msg.value.msg_id,
+                }));
+            },
+            .read => {
+                const read_msg = msg.fromValue(read, self.allocator) catch |err| {
+                    log.err("failed to destructure broadcast mesage: {}", .{err});
+                    return;
+                };
+                defer read_msg.deinit();
+                self.reply(msg.into(read, .{
+                    .type = "read_ok",
+                    .msg_id = self.node.nextId(),
+                    .in_reply_to = read_msg.value.msg_id,
+                    .messages = self.messages.items,
+                }));
+            },
+            .topology => {
+                const topo_msg = msg.fromValue(topology, self.allocator) catch |err| {
+                    log.err("failed to destructure topology message: {}", .{err});
+                    return;
+                };
+                std.json.stringify(topo_msg, .{}, std.io.getStdErr().writer()) catch
+                    log.err("failed to stringify topology", .{});
+                self.reply(msg.into(topology, .{
+                    .type = "topology_ok",
+                    .msg_id = self.node.nextId(),
+                    .in_reply_to = @intCast(msg.body.object.get("msg_id").?.integer),
+                }));
+            },
+        }
     }
 
     pub fn service(self: *Bcast) Service {
@@ -115,7 +128,31 @@ pub const Bcast = struct {
                 .start = start,
                 .handle = handle,
                 .state = state,
+                .contains = contains,
+                .stop = stop,
             },
         };
+    }
+
+    fn getSelf(ctx: *anyopaque) *Bcast {
+        return Node.alignCastPtr(Bcast, ctx);
+    }
+
+    pub fn start(ctx: *anyopaque, n: *Node) void {
+        const self = getSelf(ctx);
+        self.node = n;
+        self.status = .active;
+    }
+
+    pub fn state(ctx: *anyopaque) State {
+        return getSelf(ctx).status;
+    }
+
+    pub fn stop(_: *anyopaque) void {}
+
+    pub fn contains(ctx: *anyopaque, msg_type: []const u8) bool {
+        return getSelf(ctx).message_set.contains(
+            std.meta.stringToEnum(Types, msg_type) orelse return false,
+        );
     }
 };

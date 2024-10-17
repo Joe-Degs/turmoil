@@ -14,9 +14,14 @@ pub fn main() !void {
     };
 }
 
-pub fn echoHandler(node: *Node, msg: *Message) !void {
-    msg.set("type", .{ .string = "echo_ok" }) catch unreachable;
-    msg.dest = msg.src;
-    msg.src = node.id;
-    try node.send(msg, null);
+pub fn echoHandler(node: *Node, msg: Message(std.json.Value)) !void {
+    const echo = .{
+        .type = "echo_ok",
+        .msg_id = node.nextId(),
+        .in_reply_to = msg.body.object.get("msg_id").?.integer,
+        .echo = msg.body.object.get("echo").?.string,
+    };
+    const response = msg.into(@TypeOf(echo), echo);
+    try std.json.stringify(response, .{}, std.io.getStdErr().writer());
+    try node.reply(response);
 }
