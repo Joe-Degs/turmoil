@@ -28,13 +28,6 @@ pub fn main() !void {
 
 const Types = enum { read, broadcast, topology };
 
-const topology = struct {
-    type: []const u8,
-    msg_id: usize,
-    in_reply_to: ?usize = null,
-    topology: ?std.json.Value = null,
-};
-
 const broadcast = struct {
     type: []const u8,
     msg_id: usize,
@@ -42,7 +35,12 @@ const broadcast = struct {
     message: ?usize = null,
 };
 
-const read = struct { type: []const u8, msg_id: usize, in_reply_to: ?usize = null, messages: ?[]usize = null };
+const read = struct {
+    type: []const u8,
+    msg_id: usize,
+    in_reply_to: ?usize = null,
+    messages: ?[]usize = null,
+};
 
 pub const Bcast = struct {
     node: *Node = undefined,
@@ -53,12 +51,16 @@ pub const Bcast = struct {
     message_set: std.EnumSet(Types) = std.EnumSet(Types).initFull(),
 
     thread: ?std.Thread = null,
+    running: std.atomic.Value(bool),
+    queue: std.TailQueue(std.json.Parsed(Message(std.json.Value))),
 
     pub fn init(allocator: std.mem.Allocator) Bcast {
         return Bcast{
             .allocator = allocator,
             .messages = std.ArrayList(usize).init(allocator),
             .status = .initialized,
+            .queue = .{},
+            .running = std.atomic.Value(bool).init(false),
         };
     }
 
@@ -106,17 +108,12 @@ pub const Bcast = struct {
                 }));
             },
             .topology => {
-                const topo_msg = msg.fromValue(topology, self.allocator) catch |err| {
-                    log.err("failed to destructure topology message: {}", .{err});
-                    return;
-                };
-                std.json.stringify(topo_msg, .{}, std.io.getStdErr().writer()) catch
-                    log.err("failed to stringify topology", .{});
-                self.reply(msg.into(topology, .{
+                const response = .{
                     .type = "topology_ok",
                     .msg_id = self.node.nextId(),
-                    .in_reply_to = @intCast(msg.body.object.get("msg_id").?.integer),
-                }));
+                    .in_reply_to = msg.body.object.get("msg_id").?.integer,
+                };
+                self.reply(msg.into(@TypeOf(response), response));
             },
         }
     }
