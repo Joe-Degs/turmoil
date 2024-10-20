@@ -96,6 +96,8 @@ pub fn deinit(node: *Node) void {
 
     node.node_ids.deinit();
     node.handlers.deinit();
+
+    for (node.services.items) |service| service.stop();
     node.services.deinit();
 
     node.arena.deinit();
@@ -179,9 +181,7 @@ pub fn run(node: *Node, alt_reader: anytype, alt_writer: anytype) !void {
         // read the next message
         const payload = try node.readBytes(alt_reader) orelse return;
         const msg = try Message(std.json.Value).decode(allocator, payload);
-        try node.processMessage(msg.value);
-        errdefer msg.deinit();
-        msg.deinit();
+        try node.processMessage(msg);
 
         // let's reset the allocator for another round of allocations. but we
         // don't want to be freeing memory in a tight loop so we retain the
@@ -205,11 +205,14 @@ fn readBytes(node: *Node, alt_reader: anytype) !?[]u8 {
     };
 }
 
-pub fn processMessage(node: *Node, msg: Message(std.json.Value)) !void {
-    const msg_type = msg.body.object.get("type").?.string;
+pub fn processMessage(node: *Node, msg: std.json.Parsed(Message(std.json.Value))) !void {
+    const msg_type = msg.value.body.object.get("type").?.string;
 
     // check if there is a handler for service
-    if (node.handlers.get(msg_type)) |handler| return handler(node, msg);
+    if (node.handlers.get(msg_type)) |handler| {
+        defer msg.deinit();
+        return handler(node, msg.value);
+    }
 
     for (node.services.items) |service| {
         if (service.contains(msg_type)) {
@@ -283,7 +286,7 @@ pub const Service = struct {
         contains: *const fn (ctx: *anyopaque, msg_type: []const u8) bool,
 
         /// handle the messages
-        handle: *const fn (ctx: *anyopaque, m: Message(std.json.Value)) void,
+        handle: *const fn (ctx: *anyopaque, m: std.json.Parsed(Message(std.json.Value))) void,
 
         /// get the state of the handler
         state: *const fn (ctx: *anyopaque) State,
@@ -297,7 +300,7 @@ pub const Service = struct {
         return self.vtable.start(self.ptr, n);
     }
 
-    pub fn handle(self: Service, m: Message(std.json.Value)) void {
+    pub fn handle(self: Service, m: std.json.Parsed(Message(std.json.Value))) void {
         return self.vtable.handle(self.ptr, m);
     }
 
@@ -305,7 +308,7 @@ pub const Service = struct {
         return self.vtable.state(self.ptr);
     }
 
-    pub fn stop(self: Service) State {
+    pub fn stop(self: Service) void {
         return self.vtable.stop(self.ptr);
     }
 

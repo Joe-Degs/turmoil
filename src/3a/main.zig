@@ -42,6 +42,8 @@ const read = struct {
     messages: ?[]usize = null,
 };
 
+const MQ = std.TailQueue(std.json.Parsed(Message(std.json.Value)));
+
 pub const Bcast = struct {
     node: *Node = undefined,
     allocator: std.mem.Allocator,
@@ -52,20 +54,24 @@ pub const Bcast = struct {
 
     thread: ?std.Thread = null,
     running: std.atomic.Value(bool),
-    queue: std.TailQueue(std.json.Parsed(Message(std.json.Value))),
+    queue: MQ,
 
     pub fn init(allocator: std.mem.Allocator) Bcast {
         return Bcast{
             .allocator = allocator,
             .messages = std.ArrayList(usize).init(allocator),
             .status = .initialized,
-            .queue = .{},
+            .queue = MQ{},
             .running = std.atomic.Value(bool).init(false),
         };
     }
 
     pub fn deinit(self: *Bcast) void {
+        self.thread.?.join();
+        self.running.store(false, .seq_cst);
+        self.status = .stopped;
         self.messages.deinit();
+        self.thread = null;
     }
 
     fn reply(self: *Bcast, msg: anytype) void {
@@ -74,9 +80,16 @@ pub const Bcast = struct {
         };
     }
 
-    fn handle(ctx: *anyopaque, msg: Message(std.json.Value)) void {
-        const self = getSelf(ctx);
+    fn processMessages(self: *Bcast) void {
+        while (self.running.load(.seq_cst)) {
+            if (self.queue.popFirst()) |node| {
+                self.handleMessage(node.data.value);
+                node.data.deinit();
+            } else std.time.sleep(10 * std.time.ns_per_ms);
+        }
+    }
 
+    pub fn handleMessage(self: *Bcast, msg: Message(std.json.Value)) void {
         switch (std.meta.stringToEnum(Types, msg.body.object.get("type").?.string) orelse return) {
             .broadcast => {
                 const bcast_msg = msg.fromValue(broadcast, self.allocator) catch |err| {
@@ -118,6 +131,17 @@ pub const Bcast = struct {
         }
     }
 
+    fn handle(ctx: *anyopaque, msg: std.json.Parsed(Message(std.json.Value))) void {
+        const self = getSelf(ctx);
+        _ = blk: {
+            const node = self.allocator.create(MQ.Node) catch |err| break :blk err;
+            node.* = MQ.Node{ .data = msg };
+            self.queue.append(node);
+        } catch |err| {
+            log.err("failed to add message to queue: {}", .{err});
+        };
+    }
+
     pub fn service(self: *Bcast) Service {
         return .{
             .ptr = self,
@@ -137,7 +161,14 @@ pub const Bcast = struct {
 
     pub fn start(ctx: *anyopaque, n: *Node) void {
         const self = getSelf(ctx);
+        if (self.thread != null) return;
+
         self.node = n;
+        self.thread = std.Thread.spawn(.{}, processMessages, .{self}) catch |err| {
+            log.err("failed to start message processing thread: {}", .{err});
+            return;
+        };
+        self.running.store(true, .seq_cst);
         self.status = .active;
     }
 
@@ -145,7 +176,12 @@ pub const Bcast = struct {
         return getSelf(ctx).status;
     }
 
-    pub fn stop(_: *anyopaque) void {}
+    pub fn stop(ctx: *anyopaque) void {
+        const self = getSelf(ctx);
+
+        if (self.thread == null) return;
+        self.deinit();
+    }
 
     pub fn contains(ctx: *anyopaque, msg_type: []const u8) bool {
         return getSelf(ctx).message_set.contains(
