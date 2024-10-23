@@ -8,12 +8,12 @@ const Allocator = std.mem.Allocator;
 const testing = std.testing;
 const assert = std.debug.assert;
 
-const log = std.log.scoped(.Node);
+const log = std.log.scoped(.maelstrom_agent);
 
 const Node = @This();
 
 const stringify_options = .{ .emit_null_optional_fields = false };
-const parse_options = .{ .ignore_unknown_fields = true };
+const parse_options = .{ .ignore_unknown_fields = true, .allocate = .alloc_always };
 
 pub const State = enum {
     /// node has not yet recieved an `init` request
@@ -333,13 +333,17 @@ pub fn Message(comptime T: type) type {
     return struct {
         const Self = @This();
 
-        src: ?[]const u8 = null,
-        dest: ?[]const u8 = null,
+        src: []const u8 = undefined,
+        dest: []const u8 = undefined,
 
         /// Every message that comes through the wire has (or not) a body, this body
         /// contains contains the actual message. if you don't know
         /// the type of the body before hand, you can use the std.json.Value type.
         body: T,
+
+        pub fn init(src: []const u8, dest: []const u8, payload: T) Message(T) {
+            return .{ .src = src, .dest = dest, .body = payload };
+        }
 
         /// decodeMessage unmarshals a json string into a message object, it allocate's
         /// memory which must be freed when message is no longer in use.
@@ -361,6 +365,14 @@ pub fn Message(comptime T: type) type {
             return Message(P){
                 .src = msg.dest,
                 .dest = msg.src,
+                .body = payload,
+            };
+        }
+
+        pub fn intoAlloc(msg: Self, comptime P: type, payload: P, allocator: std.mem.Allocator) !Message(P) {
+            return Message(P){
+                .src = try allocator.dupeZ(u8, msg.dest),
+                .dest = try allocator.dupeZ(u8, msg.src),
                 .body = payload,
             };
         }

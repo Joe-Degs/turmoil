@@ -1,4 +1,4 @@
-/// Single node broadcast system
+/// Multi node broadcast
 const std = @import("std");
 const Node = @import("Node");
 const Set = @import("Set").Set;
@@ -7,7 +7,7 @@ const Message = Node.Message;
 const Service = Node.Service;
 const State = Node.State;
 
-const log = std.log.scoped(.Bcast);
+const log = std.log.scoped(.multi_node_broadcast);
 
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -20,7 +20,7 @@ pub fn main() !void {
     var bcast = Bcast.init(allocator);
     defer bcast.deinit();
 
-    try node.registerService("broadcast read topology", bcast.service());
+    try node.services.append(bcast.service());
 
     node.run(null, null) catch |err| {
         log.err("node died with err: {}", .{err});
@@ -28,107 +28,265 @@ pub fn main() !void {
     };
 }
 
+const Types = enum { read, broadcast, topology, gossip, gossip_ok };
+
+const broadcast = struct {
+    type: []const u8,
+    msg_id: usize,
+    in_reply_to: ?usize = null,
+    message: ?usize = null,
+};
+
+const read = struct {
+    type: []const u8,
+    msg_id: usize,
+    in_reply_to: ?usize = null,
+    messages: ?[]usize = null,
+};
+
+const gossip = struct {
+    type: []const u8,
+    msg_id: usize,
+    in_reply_to: ?usize = null,
+    messages: ?[]usize = null,
+};
+
+const MQ = std.TailQueue(std.json.Parsed(Message(std.json.Value)));
+
 pub const Bcast = struct {
     node: *Node = undefined,
     allocator: std.mem.Allocator,
+
     status: State = .uninitialized,
-
     messages: Set(usize) = undefined,
-    neigborhood: std.ArrayList([]const u8) = undefined,
+    neighborhood: std.ArrayList([]const u8),
+    message_set: std.EnumSet(Types) = std.EnumSet(Types).initFull(),
 
-    const M = enum { broadcast, read, topology };
+    thread: ?std.Thread = null,
+    running: std.atomic.Value(bool),
+    queue: MQ,
+    mutex: std.Thread.RwLock,
 
     pub fn init(allocator: std.mem.Allocator) Bcast {
         return Bcast{
             .allocator = allocator,
             .messages = Set(usize).init(allocator),
-            .neigborhood = std.ArrayList([]const u8).init(allocator),
+            .neighborhood = std.ArrayList([]const u8).init(allocator),
             .status = .initialized,
+            .queue = MQ{},
+            .running = std.atomic.Value(bool).init(false),
+            .mutex = .{},
         };
     }
 
     pub fn deinit(self: *Bcast) void {
+        self.thread.?.join();
+        self.running.store(false, .seq_cst);
+        self.status = .stopped;
         self.messages.deinit();
+        self.thread = null;
     }
 
-    fn getSelf(ctx: *anyopaque) *Bcast {
-        return Node.alignCastPtr(Bcast, ctx);
+    fn reply(self: *Bcast, msg: anytype) void {
+        self.node.reply(msg) catch |err| {
+            log.err("failed to send reply: {}", .{err});
+        };
     }
 
-    fn start(ctx: *anyopaque, n: *Node) void {
+    const GOSSIP_INTERVAL = 1500 * std.time.ns_per_ms;
+    const BACKOFF_TIME = 10 * std.time.ns_per_ms;
+
+    fn processMessages(self: *Bcast) void {
+        var timer = std.time.Timer.start() catch |err| {
+            log.err("failed to start timer: {}", .{err});
+            return;
+        };
+
+        while (self.running.load(.seq_cst)) {
+            if (self.queue.popFirst()) |node| {
+                self.handleMessage(node.data.value);
+                node.data.deinit();
+                self.allocator.destroy(node);
+            } else std.time.sleep(BACKOFF_TIME);
+
+            if (timer.read() >= GOSSIP_INTERVAL) {
+                self.startGossipSequence();
+                timer.reset();
+            }
+        }
+    }
+
+    pub fn startGossipSequence(self: *Bcast) void {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        if (self.neighborhood.items.len < 1 and self.messages.cardinality() < 1) return;
+        const msg = collectIntoSlice(self.allocator, self.messages) catch {
+            log.err("failed to collect set into slice", .{});
+            return;
+        };
+        defer self.allocator.free(msg);
+        for (self.neighborhood.items) |neighbor| {
+            // log.info("sending gossip to neighbor: {s}", .{neighbor});
+            self.node.send(Message(gossip){
+                .src = self.node.id,
+                .dest = neighbor,
+                .body = .{
+                    .type = "gossip",
+                    .msg_id = self.node.nextId(),
+                    .messages = msg,
+                },
+            }, null) catch |err|
+                log.err("failed to send gossip sequence to '{s}': {}", .{ neighbor, err });
+        }
+    }
+
+    pub fn handleMessage(self: *Bcast, msg: Message(std.json.Value)) void {
+        switch (std.meta.stringToEnum(Types, msg.body.object.get("type").?.string) orelse return) {
+            .broadcast => {
+                const bcast_msg: std.json.Parsed(broadcast) = msg.fromValue(broadcast, self.allocator) catch |err| {
+                    log.err("failed to destructure broadcast mesage: {}", .{err});
+                    return;
+                };
+                defer bcast_msg.deinit();
+                _ = blk: {
+                    self.mutex.lock();
+                    defer self.mutex.unlock();
+                    const insert = self.messages.add(bcast_msg.value.message.?) catch |err| break :blk err;
+                    if (!insert) break :blk error.FailedToAddSetElem;
+                } catch |err| {
+                    log.err("failed to append to message log: {}", .{err});
+                    return;
+                };
+                self.reply(msg.into(broadcast, .{
+                    .type = "broadcast_ok",
+                    .msg_id = self.node.nextId(),
+                    .in_reply_to = bcast_msg.value.msg_id,
+                }));
+            },
+            .read => {
+                const read_msg = msg.fromValue(read, self.allocator) catch |err| {
+                    log.err("failed to destructure broadcast mesage: {}", .{err});
+                    return;
+                };
+                defer read_msg.deinit();
+
+                self.mutex.lockShared();
+                defer self.mutex.unlockShared();
+                const elements = collectIntoSlice(self.allocator, self.messages) catch |err| {
+                    log.err("failed to read broadcast messages from mem: {}", .{err});
+                    return;
+                };
+                defer self.allocator.free(elements);
+                self.reply(msg.into(read, .{
+                    .type = "read_ok",
+                    .msg_id = self.node.nextId(),
+                    .in_reply_to = read_msg.value.msg_id,
+                    .messages = elements,
+                }));
+            },
+            .topology => {
+                _ = blk: {
+                    const topology = msg.body.object.get("topology").?.object;
+                    self.mutex.lock();
+                    defer self.mutex.unlock();
+                    if (topology.get(self.node.id)) |neighbors| {
+                        for (neighbors.array.items) |neighbor| {
+                            const string = self.allocator.dupeZ(u8, neighbor.string) catch continue;
+                            self.neighborhood.append(string) catch |err| break :blk err;
+                        }
+                    }
+                } catch |err| {
+                    log.err("failed to get and update topology: {}", .{err});
+                    return;
+                };
+                log.info("node {s} can talk to {s}", .{
+                    self.node.id,
+                    std.mem.join(self.allocator, ", ", self.neighborhood.items) catch unreachable,
+                });
+                const response = .{
+                    .type = "topology_ok",
+                    .msg_id = self.node.nextId(),
+                    .in_reply_to = msg.body.object.get("msg_id").?.integer,
+                };
+                self.reply(msg.into(@TypeOf(response), response));
+            },
+            .gossip => {
+                const gossip_msg = msg.fromValue(gossip, self.allocator) catch |err| {
+                    log.err("failed to destructure gossip mesage: {}", .{err});
+                    return;
+                };
+                defer gossip_msg.deinit();
+                const difference = blk: {
+                    const gossip_messages = gossip_msg.value.messages orelse break :blk null;
+                    self.mutex.lock();
+                    defer self.mutex.unlock();
+                    _ = self.messages.appendSlice(gossip_messages) catch |err| {
+                        log.err("failed to append gossip message: {}", .{err});
+                        return;
+                    };
+
+                    // now we find the difference of the two sets
+                    var gossip_set = Set(usize).init(self.allocator);
+                    defer gossip_set.deinit();
+                    _ = gossip_set.appendSlice(gossip_messages) catch |err| {
+                        log.err("failed to append gossip message: {}", .{err});
+                        return;
+                    };
+
+                    const diff_set = self.messages.differenceOf(gossip_set) catch |err| {
+                        log.err("failed to get gossip difference: {}", .{err});
+                        return;
+                    };
+                    const diff = collectIntoSlice(self.allocator, diff_set) catch return;
+                    break :blk diff;
+                };
+                defer self.allocator.free(difference.?);
+                const response = .{
+                    .type = "gossip_ok",
+                    .msg_id = self.node.nextId(),
+                    .in_reply_to = msg.body.object.get("msg_id").?.integer,
+                    .messages = difference,
+                };
+                // log.info("sending gossip_ok sequence: {}", .{response});
+                self.reply(msg.into(@TypeOf(response), response));
+            },
+            .gossip_ok => {
+                // log.info("got gossip_ok message", .{});
+                const gossip_msg = msg.fromValue(gossip, self.allocator) catch |err| {
+                    log.err("failed to destructure gossip_ok message: {}", .{err});
+                    return;
+                };
+                defer gossip_msg.deinit();
+                self.mutex.lock();
+                defer self.mutex.unlock();
+                _ = self.messages.appendSlice(gossip_msg.value.messages orelse return) catch |err| {
+                    log.err("failed to handle gossip_ok message: {}", .{err});
+                };
+            },
+        }
+    }
+
+    // collect set elements into a slice and return that slice, allocates memory that should
+    // be freed by the caller
+    pub fn collectIntoSlice(allocator: std.mem.Allocator, set: Set(usize)) ![]usize {
+        var it = set.iterator();
+        var elements = try allocator.alloc(usize, set.cardinality());
+        var i: usize = 0;
+        while (it.next()) |el| : (i += 1) elements[i] = el.*;
+        return elements;
+    }
+
+    fn handle(ctx: *anyopaque, msg: std.json.Parsed(Message(std.json.Value))) void {
         const self = getSelf(ctx);
-        self.node = n;
-        // self.status = .running;
-    }
-
-    fn state(ctx: *anyopaque) State {
-        return getSelf(ctx).status;
-    }
-
-    const ReadOk = struct { type: []const u8 = "read_ok", messages: std.ArrayList(usize) };
-
-    pub fn read(self: *Bcast, msg: *Message) !void {
-        var message_list = std.ArrayList(usize).init(self.allocator);
-        defer message_list.deinit();
-
-        if (!self.messages.isEmpty()) {
-            var message_it = self.messages.iterator();
-            while (message_it.next()) |message| try message_list.append(message.*);
-        }
-
-        // msg.set("type", .{ .string = "read_ok" }) catch unreachable;
-        // msg.set(
-        //     "messages",
-        //     .{ .array = message_list },
-        // ) catch unreachable;
-
-        const response = try Message.from(self.allocator, self.node.id, msg.src, &ReadOk{
-            .messages = message_list,
-        });
-
-        try self.node.reply(response);
-    }
-
-    pub fn topology(self: *Bcast, msg: *Message) !void {
-        const neigborhood = try std.json.parseFromValue(
-            []const []const u8,
-            self.allocator,
-            msg.get("topology").?.object.get(self.node.id).?,
-            .{},
-        );
-        defer self.deinit();
-        self.neigborhood.clearRetainingCapacity();
-        try self.neigborhood.appendSlice(neigborhood.value);
-
-        // send a topology ok
-        msg.set("type", .{ .string = "topology_ok" }) catch unreachable;
-        _ = msg.remove("topology");
-        try self.node.reply(msg);
-    }
-
-    pub fn broadcast(self: *Bcast, msg: *Message) !void {
-        const message = msg.get("message").?.integer;
-        if (try self.messages.add(@intCast(message))) {
-            msg.set("type", .{ .string = "broadcast_ok" }) catch unreachable;
-            _ = msg.remove("message");
-            try self.node.reply(msg);
-        }
-    }
-
-    fn handle(ctx: *anyopaque, msg: *Message) void {
-        const self = getSelf(ctx);
-
-        switch (std.meta.stringToEnum(M, msg.getType()).?) {
-            .read => self.read(msg) catch |err| {
-                log.err("failed to read: {}", .{err});
-            },
-            .topology => self.topology(msg) catch |err| {
-                log.err("error while handling topology: {}", .{err});
-            },
-            .broadcast => self.broadcast(msg) catch |err| {
-                log.err("error while handling broadcast: {}", .{err});
-            },
-        }
+        _ = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const node = self.allocator.create(MQ.Node) catch |err| break :blk err;
+            node.* = MQ.Node{ .data = msg };
+            self.queue.append(node);
+        } catch |err| {
+            log.err("failed to add message to queue: {}", .{err});
+        };
     }
 
     pub fn service(self: *Bcast) Service {
@@ -138,7 +296,43 @@ pub const Bcast = struct {
                 .start = start,
                 .handle = handle,
                 .state = state,
+                .contains = contains,
+                .stop = stop,
             },
         };
+    }
+
+    fn getSelf(ctx: *anyopaque) *Bcast {
+        return Node.alignCastPtr(Bcast, ctx);
+    }
+
+    pub fn start(ctx: *anyopaque, n: *Node) void {
+        const self = getSelf(ctx);
+        if (self.thread != null) return;
+
+        self.node = n;
+        self.thread = std.Thread.spawn(.{}, processMessages, .{self}) catch |err| {
+            log.err("failed to start message processing thread: {}", .{err});
+            return;
+        };
+        self.running.store(true, .seq_cst);
+        self.status = .active;
+    }
+
+    pub fn state(ctx: *anyopaque) State {
+        return getSelf(ctx).status;
+    }
+
+    pub fn stop(ctx: *anyopaque) void {
+        const self = getSelf(ctx);
+
+        if (self.thread == null) return;
+        self.deinit();
+    }
+
+    pub fn contains(ctx: *anyopaque, msg_type: []const u8) bool {
+        return getSelf(ctx).message_set.contains(
+            std.meta.stringToEnum(Types, msg_type) orelse return false,
+        );
     }
 };
