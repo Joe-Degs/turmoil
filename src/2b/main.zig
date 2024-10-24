@@ -62,8 +62,8 @@ pub const UniqueIdGenerator = struct {
         return getSelf(ctx).status;
     }
 
-    fn set(_: *anyopaque) Node.MessageSet {
-        return msg_set;
+    fn contains(_: *anyopaque, msg_type: []const u8) bool {
+        return std.mem.eql(u8, msg_type, "generate");
     }
 
     fn stop(_: *anyopaque) void {}
@@ -75,7 +75,7 @@ pub const UniqueIdGenerator = struct {
         return self.node_id orelse error.NodeNotInitialized;
     }
 
-    fn generatId(self: *UniqueIdGenerator, msg: Message(Generate)) !void {
+    fn generateId(self: *UniqueIdGenerator, msg: Message(Generate)) !void {
         var current_time = std.time.milliTimestamp();
         var counter_value = self.counter.fetchAdd(1, .monotonic);
 
@@ -95,11 +95,15 @@ pub const UniqueIdGenerator = struct {
         }));
     }
 
-    fn handle(ctx: *anyopaque, msg: Message(std.json.Value)) void {
+    fn handle(ctx: *anyopaque, msg: std.json.Parsed(Message(std.json.Value))) void {
+        defer msg.deinit();
         const self = getSelf(ctx);
-        self.generatId(msg.fromValue(Generate, self.allocator) catch unreachable) catch |err| {
-            log.err("failed while generating id: {}", .{err});
-        };
+        const generate_msg = msg.value.fromValue(Generate, self.allocator) catch |err|
+            return log.err("failed while generating id: {}", .{err});
+        defer generate_msg.deinit();
+
+        self.generateId(Message(Generate).init(msg.value.src, msg.value.dest, generate_msg.value)) catch |err|
+            return log.err("failed to handle generate message: {}", .{err});
     }
 
     fn service(self: *UniqueIdGenerator) Service {
@@ -109,7 +113,7 @@ pub const UniqueIdGenerator = struct {
                 .start = start,
                 .handle = handle,
                 .state = state,
-                .set = set,
+                .contains = contains,
                 .stop = stop,
             },
         };

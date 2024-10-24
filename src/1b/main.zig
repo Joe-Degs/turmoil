@@ -24,7 +24,6 @@ pub fn main() !void {
 pub const Echo = struct {
     node: *Node = undefined,
     status: State = .uninitialized,
-    msg_set: Node.MessageSet = Node.MessageSet.init(.{ .echo = true }),
 
     fn getSelf(ctx: *anyopaque) *Echo {
         return Node.alignCastPtr(Echo, ctx);
@@ -44,8 +43,8 @@ pub const Echo = struct {
         _ = ctx;
     }
 
-    fn set(ctx: *anyopaque) Node.MessageSet {
-        return getSelf(ctx).msg_set;
+    fn contains(_: *anyopaque, msg_type: []const u8) bool {
+        return std.mem.eql(u8, msg_type, "echo");
     }
 
     const EchoMsg = struct {
@@ -65,9 +64,10 @@ pub const Echo = struct {
         try self.node.reply(echo_res);
     }
 
-    fn handle(ctx: *anyopaque, msg: Message(std.json.Value)) void {
-        getSelf(ctx).echo(msg) catch |err| {
-            log.err("failed while handling request: {}", .{err});
+    fn handle(ctx: *anyopaque, msg: std.json.Parsed(Message(std.json.Value))) void {
+        defer msg.deinit();
+        getSelf(ctx).echo(msg.value) catch |err| {
+            log.err("failed while handling echo request: {}", .{err});
         };
     }
 
@@ -79,7 +79,7 @@ pub const Echo = struct {
                 .handle = handle,
                 .state = state,
                 .stop = stop,
-                .set = set,
+                .contains = contains,
             },
         };
     }
