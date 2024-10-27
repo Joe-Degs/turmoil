@@ -77,7 +77,7 @@ pub fn init(allocator: Allocator) !*Node {
     const node = try allocator.create(Node);
     node.* = Node{
         .allocator = allocator,
-        .buf = try allocator.alloc(u8, 1024),
+        .buf = try allocator.alloc(u8, 4096),
         .arena = std.heap.ArenaAllocator.init(allocator),
         .node_ids = std.ArrayList([]const u8).init(allocator),
 
@@ -182,13 +182,6 @@ pub fn run(node: *Node, alt_reader: anytype, alt_writer: anytype) !void {
         const payload = try node.readBytes(alt_reader) orelse return;
         const msg = try Message(std.json.Value).decode(allocator, payload);
         try node.processMessage(msg);
-
-        // let's reset the allocator for another round of allocations. but we
-        // don't want to be freeing memory in a tight loop so we retain the
-        // capacity for the next round.
-        if (@atomicLoad(usize, &node.next_id, .seq_cst) % 50 == 0) {
-            _ = node.arena.reset(.retain_capacity);
-        }
     }
 }
 
@@ -500,7 +493,7 @@ const Simulator = struct {
     fn read(t: *@This(), allocator: Allocator) ?std.json.Parsed(Message(std.json.Value)) {
         if (t.use_events) t.notify_read.wait();
 
-        var buf: [512]u8 = undefined;
+        var buf: [1024]u8 = undefined;
         while (true) {
             const bytes = t.pipe.reader().readUntilDelimiter(&buf, '\n') catch |err| switch (err) {
                 error.EndOfStream, error.OperationAborted => continue,

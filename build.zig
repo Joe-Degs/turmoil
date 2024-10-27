@@ -108,4 +108,16 @@ const challenges = [_]struct {
         .workload = "broadcast",
         .args = &[_][]const u8{ "--node-count", "5", "--time-limit", "20", "--rate", "10" },
     },
+    .{
+        .name = "3c",
+        .description = "multi-node node broadcast accross a cluster with partitions; fly.io/dist-sys",
+        .workload = "broadcast",
+        .args = &[_][]const u8{ "--node-count", "5", "--time-limit", "20", "--rate", "10", "--nemesis", "partition" },
+    },
+    .{
+        .name = "3d",
+        .description = "Efficient Broadcast, Part I; fly.io/dist-sys/3d/",
+        .workload = "broadcast",
+        .args = &[_][]const u8{ "--node-count", "25", "--time-limit", "20", "--rate", "100", "--latency", "100" },
+    },
 };
