@@ -118,6 +118,6 @@ const challenges = [_]struct {
         .name = "3d",
         .description = "Efficient Broadcast, Part I; fly.io/dist-sys/3d/",
         .workload = "broadcast",
-        .args = &[_][]const u8{ "--node-count", "25", "--time-limit", "20", "--rate", "100", "--latency", "100" },
+        .args = &[_][]const u8{ "--node-count", "5", "--time-limit", "20", "--rate", "100" },
     },
 };

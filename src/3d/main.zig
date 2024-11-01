@@ -28,7 +28,7 @@ pub fn main() !void {
     };
 }
 
-const Types = enum { read, broadcast, topology, gossip, gossip_ok };
+const Types = enum { read, broadcast, topology, gossip };
 
 const broadcast = struct {
     type: []const u8,
@@ -62,11 +62,11 @@ pub const Bcast = struct {
     neighborhood: std.ArrayList([]const u8),
     seen: std.StringHashMap(Set(usize)),
     message_set: std.EnumSet(Types) = std.EnumSet(Types).initFull(),
-
-    thread: ?std.Thread = null,
-    running: std.atomic.Value(bool),
-    queue: MQ,
     mutex: std.Thread.RwLock,
+    timer: ?std.time.Timer,
+
+    const GOSSIP_INTERVAL = 500 * std.time.ns_per_ms;
+    const BACKOFF_TIME = 10 * std.time.ns_per_ms;
 
     pub fn init(allocator: std.mem.Allocator) Bcast {
         return Bcast{
@@ -75,15 +75,12 @@ pub const Bcast = struct {
             .seen = std.StringHashMap(Set(usize)).init(allocator),
             .neighborhood = std.ArrayList([]const u8).init(allocator),
             .status = .initialized,
-            .queue = MQ{},
-            .running = std.atomic.Value(bool).init(false),
+            .timer = std.time.Timer.start() catch null,
             .mutex = .{},
         };
     }
 
     pub fn deinit(self: *Bcast) void {
-        self.thread.?.join();
-        self.running.store(false, .seq_cst);
         self.status = .stopped;
         self.messages.deinit();
 
@@ -94,34 +91,11 @@ pub const Bcast = struct {
             el.value_ptr.*.deinit();
         }
         self.seen.deinit();
-
-        self.thread = null;
     }
 
     fn reply(self: *Bcast, msg: anytype) void {
         self.node.reply(msg) catch |err|
             log.err("failed to reply message: {}, error: {}", .{ msg, err });
-    }
-
-    const GOSSIP_INTERVAL = 500 * std.time.ns_per_ms;
-    const BACKOFF_TIME = 10 * std.time.ns_per_ms;
-
-    fn processMessages(self: *Bcast) void {
-        var timer = std.time.Timer.start() catch |err|
-            return log.err("failed to start timer: {}", .{err});
-
-        while (self.running.load(.seq_cst)) {
-            if (self.queue.popFirst()) |node| {
-                self.handleMessage(node.data.value);
-                node.data.deinit();
-                self.allocator.destroy(node);
-            } else std.time.sleep(BACKOFF_TIME);
-
-            if (timer.read() >= GOSSIP_INTERVAL) {
-                self.startGossipSequence();
-                timer.reset();
-            }
-        }
     }
 
     pub fn startGossipSequence(self: *Bcast) void {
@@ -266,18 +240,6 @@ pub const Bcast = struct {
                     self.reply(msg.into(@TypeOf(response), response));
                 }
             },
-            .gossip_ok => {
-                const gossip_msg = msg.fromValue(gossip, self.allocator) catch |err|
-                    return log.err("failed to destructure gossip_ok message: {}", .{err});
-                defer gossip_msg.deinit();
-
-                self.mutex.lock();
-                defer self.mutex.unlock();
-                if (gossip_msg.value.messages) |messages| {
-                    _ = self.messages.appendSlice(messages) catch |err|
-                        log.err("failed to handle gossip_ok message: {}", .{err});
-                }
-            },
         }
     }
 
@@ -293,15 +255,27 @@ pub const Bcast = struct {
 
     fn handle(ctx: *anyopaque, msg: std.json.Parsed(Message(std.json.Value))) void {
         const self = getSelf(ctx);
-        _ = blk: {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            const node = self.allocator.create(MQ.Node) catch |err| break :blk err;
-            node.* = MQ.Node{ .data = msg };
-            self.queue.append(node);
-        } catch |err| {
-            log.err("failed to add message to queue: {}", .{err});
-        };
+        defer msg.deinit();
+        self.handleMessage(msg.value);
+
+        if (self.timer) |*timer| {
+            if (timer.read() >= GOSSIP_INTERVAL) {
+                self.startGossipSequence();
+                timer.reset();
+            }
+        }
+
+        {
+            var it = self.seen.iterator();
+            while (it.next()) |entry| {
+                const elems = collectIntoSlice(self.allocator, entry.value_ptr.*) catch continue;
+                log.info("node {s} knows node {s} has seen {any}", .{
+                    self.node.id,
+                    entry.key_ptr.*,
+                    elems,
+                });
+            }
+        }
     }
 
     pub fn service(self: *Bcast) Service {
@@ -323,14 +297,7 @@ pub const Bcast = struct {
 
     pub fn start(ctx: *anyopaque, n: *Node) void {
         const self = getSelf(ctx);
-        if (self.thread != null) return;
-
         self.node = n;
-        self.thread = std.Thread.spawn(.{}, processMessages, .{self}) catch |err| {
-            log.err("failed to start message processing thread: {}", .{err});
-            return;
-        };
-        self.running.store(true, .seq_cst);
         self.status = .active;
     }
 
@@ -340,8 +307,6 @@ pub const Bcast = struct {
 
     pub fn stop(ctx: *anyopaque) void {
         const self = getSelf(ctx);
-
-        if (self.thread == null) return;
         self.deinit();
     }
 
