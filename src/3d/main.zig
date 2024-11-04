@@ -60,35 +60,40 @@ pub const Bcast = struct {
     status: State = .uninitialized,
     messages: Set(usize) = undefined,
     neighborhood: std.ArrayList([]const u8),
-    seen: std.StringHashMap(Set(usize)),
+    seen: std.StringHashMap(*Set(usize)),
     message_set: std.EnumSet(Types) = std.EnumSet(Types).initFull(),
+
+    gossip_thread: ?std.Thread = null,
+    running: std.atomic.Value(bool),
     mutex: std.Thread.RwLock,
-    timer: ?std.time.Timer,
 
     const GOSSIP_INTERVAL = 500 * std.time.ns_per_ms;
-    const BACKOFF_TIME = 10 * std.time.ns_per_ms;
 
     pub fn init(allocator: std.mem.Allocator) Bcast {
         return Bcast{
             .allocator = allocator,
             .messages = Set(usize).init(allocator),
-            .seen = std.StringHashMap(Set(usize)).init(allocator),
+            .seen = std.StringHashMap(*Set(usize)).init(allocator),
             .neighborhood = std.ArrayList([]const u8).init(allocator),
             .status = .initialized,
-            .timer = std.time.Timer.start() catch null,
             .mutex = .{},
+            .running = std.atomic.Value(bool).init(false),
         };
     }
 
     pub fn deinit(self: *Bcast) void {
         self.status = .stopped;
+
+        self.running.store(false, .seq_cst);
+        self.gossip_thread.?.join();
+
         self.messages.deinit();
 
-        // remove neighbor stuff
         var it = self.seen.iterator();
         while (it.next()) |el| {
             self.allocator.free(el.key_ptr.*);
-            el.value_ptr.*.deinit();
+            el.value_ptr.*.*.deinit();
+            self.allocator.destroy(el.value_ptr.*);
         }
         self.seen.deinit();
     }
@@ -98,15 +103,27 @@ pub const Bcast = struct {
             log.err("failed to reply message: {}, error: {}", .{ msg, err });
     }
 
-    pub fn startGossipSequence(self: *Bcast) void {
+    pub fn runGossipSequence(self: *Bcast) void {
+        var timer = std.time.Timer.start() catch |err|
+            return log.err("failed to start gossip interval timer: {}", .{err});
+
+        while (self.running.load(.seq_cst)) {
+            if (timer.read() >= GOSSIP_INTERVAL) {
+                self.doGossip();
+                timer.reset();
+            }
+        }
+    }
+
+    pub fn doGossip(self: *Bcast) void {
         self.mutex.lockShared();
         defer self.mutex.unlockShared();
-        if (self.neighborhood.items.len < 1 and self.messages.cardinality() < 1) return;
+        if (self.neighborhood.items.len < 1 or self.messages.cardinality() < 1) return;
 
         for (self.neighborhood.items) |neighbor| {
             const msg = blk: {
                 if (self.seen.get(neighbor)) |neighbor_set| {
-                    const diff_set = self.messages.differenceOf(neighbor_set) catch |err|
+                    const diff_set = self.messages.differenceOf(neighbor_set.*) catch |err|
                         break :blk err;
                     const diff = collectIntoSlice(self.allocator, diff_set) catch |err|
                         break :blk err;
@@ -201,43 +218,33 @@ pub const Bcast = struct {
                     return log.err("failed to destructure gossip mesage: {}", .{err});
                 defer gossip_msg.deinit();
 
-                const difference = blk: {
-                    const gossip_messages = gossip_msg.value.messages orelse break :blk null;
+                {
+                    const gossip_messages = gossip_msg.value.messages orelse return;
                     self.mutex.lock();
                     defer self.mutex.unlock();
                     _ = self.messages.appendSlice(gossip_messages) catch |err|
                         return log.err("failed to append gossip message: {}", .{err});
 
                     // now we find the difference of the two sets
-                    var gossip_set = clk: {
+                    const gossip_set = clk: {
                         if (self.seen.get(msg.src)) |set| {
                             break :clk set;
                         } else {
                             const neighbor = self.allocator.dupeZ(u8, msg.src) catch |err|
                                 return log.err("failed to dupe neighbor string: {}", .{err});
 
-                            self.seen.put(neighbor, Set(usize).init(self.allocator)) catch |err|
+                            const neighbor_set = self.allocator.create(Set(usize)) catch |err|
+                                return log.err("failed to create set of neighbor messages: {}", .{err});
+                            neighbor_set.* = Set(usize).init(self.allocator);
+
+                            self.seen.put(neighbor, neighbor_set) catch |err|
                                 return log.err("failed to create neighbor history set: {}", .{err});
-                            break :clk self.seen.get(neighbor).?;
+                            break :clk neighbor_set;
                         }
                     };
+
                     _ = gossip_set.appendSlice(gossip_messages) catch |err|
                         return log.err("failed to append gossip message: {}", .{err});
-
-                    const diff_set = self.messages.differenceOf(gossip_set) catch |err|
-                        return log.err("failed to get gossip difference: {}", .{err});
-                    const diff = collectIntoSlice(self.allocator, diff_set) catch return;
-                    break :blk diff;
-                };
-                if (difference) |diff| {
-                    defer self.allocator.free(diff);
-                    const response = .{
-                        .type = "gossip_ok",
-                        .msg_id = self.node.nextId(),
-                        .in_reply_to = msg.body.object.get("msg_id").?.integer,
-                        .messages = diff,
-                    };
-                    self.reply(msg.into(@TypeOf(response), response));
                 }
             },
         }
@@ -258,24 +265,18 @@ pub const Bcast = struct {
         defer msg.deinit();
         self.handleMessage(msg.value);
 
-        if (self.timer) |*timer| {
-            if (timer.read() >= GOSSIP_INTERVAL) {
-                self.startGossipSequence();
-                timer.reset();
-            }
-        }
-
-        {
-            var it = self.seen.iterator();
-            while (it.next()) |entry| {
-                const elems = collectIntoSlice(self.allocator, entry.value_ptr.*) catch continue;
-                log.info("node {s} knows node {s} has seen {any}", .{
-                    self.node.id,
-                    entry.key_ptr.*,
-                    elems,
-                });
-            }
-        }
+        // if (self.node.next_id % 20 == 0) {
+        //     var it = self.seen.iterator();
+        //     while (it.next()) |entry| {
+        //         const elems = collectIntoSlice(self.allocator, entry.value_ptr.*.*) catch continue;
+        //         log.info("node {s} knows node {s} has seen {any}", .{
+        //             self.node.id,
+        //             entry.key_ptr.*,
+        //             elems,
+        //         });
+        //         self.allocator.free(elems);
+        //     }
+        // }
     }
 
     pub fn service(self: *Bcast) Service {
@@ -299,6 +300,10 @@ pub const Bcast = struct {
         const self = getSelf(ctx);
         self.node = n;
         self.status = .active;
+
+        self.gossip_thread = std.Thread.spawn(.{}, runGossipSequence, .{self}) catch |err|
+            return log.err("failed to start gossip thread for node '{s}': {}", .{ n.id, err });
+        self.running.store(true, .seq_cst);
     }
 
     pub fn state(ctx: *anyopaque) State {
