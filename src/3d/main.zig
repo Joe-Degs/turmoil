@@ -67,6 +67,8 @@ pub const Bcast = struct {
     running: std.atomic.Value(bool),
     mutex: std.Thread.RwLock,
 
+    read_buf: std.ArrayList(usize),
+
     const GOSSIP_INTERVAL = 500 * std.time.ns_per_ms;
 
     pub fn init(allocator: std.mem.Allocator) Bcast {
@@ -75,6 +77,7 @@ pub const Bcast = struct {
             .messages = Set(usize).init(allocator),
             .seen = std.StringHashMap(*Set(usize)).init(allocator),
             .neighborhood = std.ArrayList([]const u8).init(allocator),
+            .read_buf = std.ArrayList(usize).init(allocator),
             .status = .initialized,
             .mutex = .{},
             .running = std.atomic.Value(bool).init(false),
@@ -125,11 +128,11 @@ pub const Bcast = struct {
                 if (self.seen.get(neighbor)) |neighbor_set| {
                     const diff_set = self.messages.differenceOf(neighbor_set.*) catch |err|
                         break :blk err;
-                    const diff = collectIntoSlice(self.allocator, diff_set) catch |err|
+                    const diff = collectIntoList(&self.read_buf, diff_set) catch |err|
                         break :blk err;
                     break :blk diff;
                 }
-                break :blk collectIntoSlice(self.allocator, self.messages) catch |err| {
+                break :blk collectIntoList(&self.read_buf, self.messages) catch |err| {
                     log.err("failed to collect set into slice for gossip: neighbor {s}, error {}", .{ neighbor, err });
                     continue;
                 };
@@ -143,7 +146,6 @@ pub const Bcast = struct {
                 .messages = msg,
             }), null) catch |err|
                 log.err("failed to send gossip sequence to '{s}': {}", .{ neighbor, err });
-            self.allocator.free(msg);
         }
     }
 
@@ -174,11 +176,10 @@ pub const Bcast = struct {
                     return log.err("failed to destructure broadcast mesage: {}", .{err});
                 defer read_msg.deinit();
 
-                self.mutex.lockShared();
-                defer self.mutex.unlockShared();
-                const elements = collectIntoSlice(self.allocator, self.messages) catch |err|
+                self.mutex.lock();
+                defer self.mutex.unlock();
+                const elements = collectIntoList(&self.read_buf, self.messages) catch |err|
                     return log.err("failed to read broadcast messages from mem: {}", .{err});
-                defer self.allocator.free(elements);
 
                 self.reply(msg.into(read, .{
                     .type = "read_ok",
@@ -258,6 +259,16 @@ pub const Bcast = struct {
         var i: usize = 0;
         while (it.next()) |el| : (i += 1) elements[i] = el.*;
         return elements;
+    }
+
+    pub fn collectIntoList(list: *std.ArrayList(usize), set: Set(usize)) ![]usize {
+        const elems = set.cardinality();
+        list.clearRetainingCapacity();
+        try list.ensureTotalCapacity(elems);
+
+        var it = set.iterator();
+        while (it.next()) |el| try list.append(el.*);
+        return list.items[0..elems];
     }
 
     fn handle(ctx: *anyopaque, msg: std.json.Parsed(Message(std.json.Value))) void {
