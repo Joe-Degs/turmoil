@@ -251,16 +251,6 @@ pub const Bcast = struct {
         }
     }
 
-    // collect set elements into a slice and return that slice, allocates memory that should
-    // be freed by the caller
-    pub fn collectIntoSlice(allocator: std.mem.Allocator, set: Set(usize)) ![]usize {
-        var it = set.iterator();
-        var elements = try allocator.alloc(usize, set.cardinality());
-        var i: usize = 0;
-        while (it.next()) |el| : (i += 1) elements[i] = el.*;
-        return elements;
-    }
-
     pub fn collectIntoList(list: *std.ArrayList(usize), set: Set(usize)) ![]usize {
         const elems = set.cardinality();
         list.clearRetainingCapacity();

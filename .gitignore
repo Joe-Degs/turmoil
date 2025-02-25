@@ -3,3 +3,5 @@ zig-out/
 .zig-cache/
 store
 new/
+codebase.md
+excluded_paths.txt

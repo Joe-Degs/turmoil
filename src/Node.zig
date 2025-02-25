@@ -46,7 +46,7 @@ arena: std.heap.ArenaAllocator = undefined,
 id: []u8 = &[_]u8{},
 
 // temp buffer for storing bytes recieved from the network
-buf: []u8 = &[_]u8{},
+stream_buf: std.ArrayList(u8),
 
 /// msg_id of the next message that gets sent out from the node
 next_id: usize = 1,
@@ -77,9 +77,9 @@ pub fn init(allocator: Allocator) !*Node {
     const node = try allocator.create(Node);
     node.* = Node{
         .allocator = allocator,
-        .buf = try allocator.alloc(u8, 4096),
         .arena = std.heap.ArenaAllocator.init(allocator),
         .node_ids = std.ArrayList([]const u8).init(allocator),
+        .stream_buf = try std.ArrayList(u8).initCapacity(allocator, 1024),
 
         // TODO(joe): consider not initialzing the hash maps until there is
         // something to register
@@ -90,19 +90,14 @@ pub fn init(allocator: Allocator) !*Node {
 }
 
 pub fn deinit(node: *Node) void {
-    // deallocate some buffers
-    if (node.id.len > 0) node.allocator.free(node.id);
-    if (node.buf.len > 0) node.allocator.free(node.buf);
-
-    node.node_ids.deinit();
-    node.handlers.deinit();
-
     for (node.services.items) |service| service.stop();
     node.services.deinit();
+    node.handlers.deinit();
 
+    node.node_ids.deinit();
+    node.stream_buf.deinit();
+    if (node.id.len > 0) node.allocator.free(node.id);
     node.arena.deinit();
-
-    // now we obliterate the node itself
     node.allocator.destroy(node);
 }
 
@@ -189,13 +184,15 @@ fn readBytes(node: *Node, alt_reader: anytype) !?[]u8 {
     const std_in = if ((@typeInfo(@TypeOf(alt_reader)) != .Null) and
         @hasDecl(@TypeOf(alt_reader), "read")) alt_reader else node.reader();
 
-    return std_in.readUntilDelimiter(node.buf, '\n') catch |err| switch (err) {
+    node.stream_buf.clearRetainingCapacity();
+    std_in.streamUntilDelimiter(node.stream_buf.writer(), '\n', null) catch |err| switch (err) {
         error.EndOfStream, error.OperationAborted => return null,
         else => {
             log.err("failed to read json stream: {}", .{err});
             return err;
         },
     };
+    return node.stream_buf.items;
 }
 
 pub fn processMessage(node: *Node, msg: std.json.Parsed(Message(std.json.Value))) !void {
@@ -226,6 +223,7 @@ pub fn processMessage(node: *Node, msg: std.json.Parsed(Message(std.json.Value))
 pub fn reply(node: *Node, msg: anytype) !void {
     try node.send(msg, null);
 }
+
 /// send message into the network.
 /// send takes an alternative writer through which to send out messages
 pub fn send(node: *Node, msg: anytype, alt_writer: anytype) !void {
@@ -624,4 +622,5 @@ test "node - init message exchange (single thread)" {
 //
 //     sim.test_done_event.wait();
 //     try testing.expect(tnode.status == .shutdown);
+//
 // }
