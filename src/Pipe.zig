@@ -1,62 +1,97 @@
-/// A pipe is an io.Reader and io.Writer pair. Every write into the pipe
-/// is available for reading from the writer provided.
 const std = @import("std");
 const io = std.io;
 const Mutex = std.Thread.Mutex;
-const testing = std.testing;
+const Condition = std.Thread.Condition;
 
 const Self = @This();
-const Error = error{ EndOfStream, OperationAborted };
+const Error = error{
+    EndOfStream,
+    OperationWouldBlock,
+    OperationAborted,
+    PipeClosed,
+    Timeout,
+};
 
-mu: std.Thread.Mutex = .{},
+mu: Mutex = .{},
+read_cond: Condition = .{},
+write_cond: Condition = .{},
 
-/// buf is a slice that can written to as well as read from
-buf: []u8,
-wr_idx: usize = 0,
-rd_idx: usize = 0,
+read_pos: usize = 0,
+write_pos: usize = 0,
+length: usize = 0,
 
-fn mask(self: Self, idx: usize) usize {
-    return idx % self.buf.len;
+is_closed: bool = false,
+
+buffer: []u8,
+
+pub fn init(buffer: []u8) Self {
+    return .{ .buffer = buffer };
 }
-fn mask2(self: Self, idx: usize) usize {
-    return idx % (2 * self.buf.len);
-}
-fn len(self: Self) usize {
-    const wrap_offset = 2 * self.buf.len * @intFromBool(self.wr_idx < self.rd_idx);
-    const adjusted_wr_idx = self.wr_idx + wrap_offset;
-    return adjusted_wr_idx - self.rd_idx;
-}
-/// read from the underlying buffer
+
 pub fn read(self: *Self, dest: []u8) Error!usize {
-    self.mu.lock();
-    defer self.mu.unlock();
     if (dest.len == 0) return 0;
-    var n: usize = 0;
-    if (self.wr_idx == self.rd_idx) return Error.EndOfStream;
-    for (dest) |*d| {
-        d.* = self.buf[self.mask(self.rd_idx)];
-        self.rd_idx = self.mask2(self.rd_idx + 1);
-        n += 1;
-    }
-    return n;
-}
-/// write to the underlying buffer
-pub fn write(self: *Self, bytes: []const u8) Error!usize {
+
     self.mu.lock();
     defer self.mu.unlock();
-    if (bytes.len == 0) return 0;
-    if (self.len() + bytes.len > self.buf.len) return error.OperationAborted;
-    var n: usize = 0;
-    for (bytes) |b| {
-        self.buf[self.mask(self.wr_idx)] = b;
-        self.wr_idx = self.mask2(self.wr_idx + 1);
-        n += 1;
+
+    if (self.length == 0) {
+        if (self.is_closed) return error.EndOfStream;
+        self.read_cond.wait(&self.mu);
     }
-    return n;
+
+    return self.readLocked(dest);
 }
 
-const Reader = io.Reader(*Self, Error, read);
-const Writer = io.Writer(*Self, Error, write);
+pub fn readLocked(self: *Self, dest: []u8) Error!usize {
+    const to_read = @min(dest.len, self.length);
+
+    var bytes_read: usize = 0;
+    while (bytes_read < to_read) {
+        dest[bytes_read] = self.buffer[self.read_pos];
+        self.read_pos = (self.read_pos + 1) % self.buffer.len;
+        bytes_read += 1;
+    }
+
+    self.length -= bytes_read;
+    self.write_cond.signal();
+    return bytes_read;
+}
+
+pub fn write(self: *Self, src: []const u8) Error!usize {
+    if (src.len == 0) return 0;
+
+    self.mu.lock();
+    defer self.mu.unlock();
+
+    if (self.is_closed) return Error.PipeClosed;
+
+    while (self.length == self.buffer.len) {
+        if (self.is_closed) return Error.PipeClosed;
+        self.write_cond.wait(&self.mu);
+    }
+
+    return self.writeLocked(src);
+}
+
+pub fn writeLocked(self: *Self, src: []const u8) Error!usize {
+    const avail_space = self.buffer.len - self.length;
+    const to_write = @min(src.len, avail_space);
+
+    var bytes_written: usize = 0;
+    while (bytes_written < to_write) {
+        self.buffer[self.write_pos] = src[bytes_written];
+        self.write_pos = (self.write_pos + 1) % self.buffer.len;
+        bytes_written += 1;
+    }
+
+    self.length += bytes_written;
+    self.read_cond.signal();
+
+    return bytes_written;
+}
+
+pub const Reader = io.Reader(*Self, Error, read);
+pub const Writer = io.Writer(*Self, Error, write);
 
 pub fn reader(self: *Self) Reader {
     return .{ .context = self };
@@ -66,29 +101,88 @@ pub fn writer(self: *Self) Writer {
     return .{ .context = self };
 }
 
-pub fn Pipe(buffer: []u8) Self {
-    return .{ .buf = buffer };
+pub fn tryRead(self: *Self, dest: []u8) Error!usize {
+    if (dest.len == 0) return 0;
+
+    self.mu.lock();
+    defer self.mu.unlock();
+
+    if (self.length == 0) {
+        if (self.is_closed) return Error.EndOfStream;
+        return Error.OperationWouldBlock;
+    }
+
+    return self.readLocked(dest);
 }
 
-test "pipe - write/read" {
-    var buf: [512]u8 = undefined;
-    var pipe = Pipe(&buf);
+pub fn tryWrite(self: *Self, src: []const u8) Error!usize {
+    if (src.len == 0) return 0;
 
-    const hello = "hello world! fuckers";
+    self.mu.lock();
+    defer self.mu.unlock();
 
-    try pipe.writer().writeAll(hello);
+    if (self.is_closed) return error.PipeClosed;
+    if (self.length == self.buffer.len) {
+        return Error.OperationWouldBlock;
+    }
+
+    return self.writeLocked(src);
+}
+
+pub fn close(self: *Self) void {
+    self.mu.lock();
+    defer self.mu.unlock();
+
+    self.is_closed = true;
+    self.read_cond.broadcast();
+    self.write_cond.broadcast();
+}
+
+const testing = std.testing;
+
+test "Pipe - single-threaded read and write" {
+    var buf: [128]u8 = undefined;
+    var pipe = Self.init(&buf);
+
+    const hello = "hello world!";
+
+    const wrote = try pipe.tryWrite(hello);
 
     var buffer: [hello.len]u8 = undefined;
-    _ = try pipe.reader().read(&buffer);
+    _ = try pipe.tryRead(&buffer);
 
-    try testing.expect(std.mem.eql(u8, hello, &buffer));
+    try testing.expectEqual(hello.len, wrote);
+    try testing.expectEqualStrings(hello, &buffer);
 }
 
-test "pipe - different threads read/write" {
-    var buf: [512]u8 = undefined;
-    var pipe = Pipe(&buf);
+test "Pipe - Thread communication" {
+    var buffer: [128]u8 = undefined;
+    var pipe = Self.init(&buffer);
 
-    const hello = "hello world! fuckers";
+    const message = "Hello from another thread!";
+
+    const Runner = struct {
+        fn run(p: *Self) void {
+            p.writer().writeAll(message) catch unreachable;
+        }
+    };
+
+    var thread = std.Thread.spawn(.{}, Runner.run, .{&pipe}) catch unreachable;
+
+    var read_buffer: [100]u8 = undefined;
+    const bytes_read = pipe.reader().read(&read_buffer) catch unreachable;
+
+    try testing.expectEqual(message.len, bytes_read);
+    try testing.expectEqualStrings(message, read_buffer[0..bytes_read]);
+
+    thread.join();
+}
+
+test "Pipe - multi-threaded read and write" {
+    var buf: [512]u8 = undefined;
+    var pipe = Self.init(&buf);
+
+    const hello = "hello from another thread";
 
     try pipe.writer().writeAll(hello);
 
@@ -96,7 +190,7 @@ test "pipe - different threads read/write" {
         fn run(stream: anytype, data: []const u8) void {
             var buffer: [hello.len]u8 = undefined;
             _ = stream.read(&buffer) catch unreachable;
-            testing.expect(std.mem.eql(u8, data, &buffer)) catch unreachable;
+            testing.expectEqualStrings(data, &buffer) catch unreachable;
         }
     };
 
@@ -106,31 +200,4 @@ test "pipe - different threads read/write" {
         .{ pipe.reader(), hello },
     );
     thread.join();
-}
-
-test "pipe - different threads write/read" {
-    var buf: [512]u8 = undefined;
-    var pipe = Pipe(&buf);
-
-    const hello = "hello world! fuckers";
-
-    const Runner = struct {
-        fn run(stream: anytype, data: []const u8) void {
-            _ = stream.writeAll(data) catch unreachable;
-        }
-    };
-
-    var thread = try std.Thread.spawn(
-        .{},
-        Runner.run,
-        .{ pipe.writer(), hello },
-    );
-    thread.detach();
-
-    // wait for a while
-    std.time.sleep(std.time.ns_per_ms);
-
-    var buffer: [hello.len]u8 = undefined;
-    _ = try pipe.reader().read(&buffer);
-    try testing.expect(std.mem.eql(u8, hello, &buffer));
 }

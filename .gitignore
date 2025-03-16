@@ -5,3 +5,4 @@ store
 new/
 codebase.md
 excluded_paths.txt
+.DS_Store

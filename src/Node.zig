@@ -139,41 +139,49 @@ const InitOk = struct {
     msg_id: usize = 0,
 };
 
-/// initialize node for participating in the network
-fn handleInitMessage(node: *Node, msg: Message(Init), alt_writer: anytype) !void {
-    // set the node id
+fn initializeNode(node: *Node, allocator: std.mem.Allocator, alt_reader: anytype, alt_writer: anytype) !void {
+    if (node.status == .initialized) return;
+    const init_payload = try node.readBytes(alt_reader) orelse return;
+    var init_msg = try Message(Init).decode(allocator, init_payload);
+    defer init_msg.deinit();
+
+    var msg = init_msg.value;
     node.id = try node.allocator.alloc(u8, msg.body.node_id.len);
     @memcpy(node.id, msg.body.node_id);
-
-    // then add the node ids of peers in the network
     for (msg.body.node_ids) |node_id| try node.node_ids.append(node_id);
-
     const init_response = msg.into(InitOk, .{ .msg_id = node.nextId(), .in_reply_to = msg.body.msg_id });
-
     try node.send(init_response, alt_writer);
-
     node.status = .initialized;
+
+    log.info("successfully initialized node with id: {s}", .{node.id});
 }
+
+fn shutdown(node: *Node, msg: Message(std.json.Value)) !void {
+    // shutdown node and maybe deinit?? or leave it as something the runner of the node
+    // does when they return from the main run loop??
+    node.status = .shutdown;
+
+    const shutdown_response = .{
+        .type = "shutdown_ok",
+        .msg_id = node.nextId(),
+        .in_reply_to = msg.body.object.get("msg_id").?.integer,
+    };
+    const response = msg.into(@TypeOf(shutdown_response), shutdown_response);
+
+    // i'd like to have the response go to a custom writer stream if its provided
+    try node.reply(response);
+}
+
 /// wait and listen for messages on the network and delegate handlers to handle them.
 /// this is the run loop of the node, it starts the functions that waits and reads
 /// from the network and sends it off for processing.
 pub fn run(node: *Node, alt_reader: anytype, alt_writer: anytype) !void {
+    try node.registerMethod("shutdown", shutdown);
+    try node.initializeNode(node.allocator, alt_reader, alt_writer);
+
     const allocator = node.arena.allocator();
-
-    // first message is the init message right?
-    const init_payload = try node.readBytes(alt_writer) orelse return;
-    var init_msg = try Message(Init).decode(allocator, init_payload);
-    node.handleInitMessage(init_msg.value, alt_writer) catch |err| {
-        log.err("failed to initialize node: {}", .{err});
-        return err;
-    };
-    log.info("successfully initialized node with id: {s}", .{node.id});
-    init_msg.deinit();
-
     while (true) {
         if (node.status == .shutdown) return;
-
-        // read the next message
         const payload = try node.readBytes(alt_reader) orelse return;
         const msg = try Message(std.json.Value).decode(allocator, payload);
         try node.processMessage(msg);
@@ -371,17 +379,41 @@ pub fn Message(comptime T: type) type {
 }
 
 test "stringify message" {
-    const Test = struct { name: []const u8 };
-    const test_msg = Message(Test){ .body = .{ .name = "n1" } };
+    const Test = struct {
+        type: []const u8,
+        name: []const u8,
+        msg_id: u64,
+    };
+    const test_msg = Message(Test){
+        .body = .{
+            .type = "test",
+            .msg_id = 0,
+            .name = "n1",
+        },
+    };
     try std.json.stringify(test_msg, .{}, std.io.getStdErr().writer());
 }
 
-test "stringifyinto message" {
-    const Test = struct { name: []const u8 };
-    const test_msg = Message(Test){ .body = .{ .name = "n1" } };
+test "stringify into message" {
+    const Test = struct {
+        type: []const u8,
+        name: []const u8,
+        msg_id: u64,
+    };
+    const test_msg = Message(Test){
+        .body = .{
+            .type = "test",
+            .msg_id = 0,
+            .name = "n1",
+        },
+    };
     // try std.json.stringify(test_msg, .{}, std.io.getStdErr().writer());
 
-    try std.json.stringify(test_msg.into(Test, .{ .name = "n2" }), .{}, std.io.getStdErr().writer());
+    try std.json.stringify(test_msg.into(Test, .{
+        .type = "test",
+        .msg_id = 0,
+        .name = "n2",
+    }), .{}, std.io.getStdErr().writer());
 }
 
 fn dump(msg: anytype) !void {
@@ -390,8 +422,18 @@ fn dump(msg: anytype) !void {
 }
 
 test "stringify anytype func" {
-    const Test = struct { name: []const u8 };
-    const test_msg = Message(Test){ .body = .{ .name = "n1" } };
+    const Test = struct {
+        type: []const u8,
+        name: []const u8,
+        msg_id: u64,
+    };
+    const test_msg = Message(Test){
+        .body = .{
+            .type = "test",
+            .msg_id = 0,
+            .name = "n1",
+        },
+    };
     try dump(test_msg);
 }
 
@@ -410,13 +452,14 @@ test "message into struct" {
     defer arena.deinit();
 
     const Echo = struct {
+        type: []const u8 = "test",
         msg_id: usize,
         echo: []const u8,
     };
 
     const msg = try Message(Echo).decode(arena.allocator(), json_payload);
-    try testing.expect(std.mem.eql(u8, "n1", msg.value.src.?));
-    try testing.expect(std.mem.eql(u8, "c1", msg.value.dest.?));
+    try testing.expect(std.mem.eql(u8, "n1", msg.value.src));
+    try testing.expect(std.mem.eql(u8, "c1", msg.value.dest));
     try testing.expect(1 == msg.value.body.msg_id);
     try testing.expect(std.mem.eql(u8, "Hello, World!", msg.value.body.echo));
 }
@@ -436,128 +479,106 @@ test "message into json value" {
     defer arena.deinit();
 
     const msg = try Message(std.json.Value).decode(arena.allocator(), json_payload);
-    try testing.expect(std.mem.eql(u8, "n1", msg.value.src.?));
-    try testing.expect(std.mem.eql(u8, "c1", msg.value.dest.?));
+    try testing.expect(std.mem.eql(u8, "n1", msg.value.src));
+    try testing.expect(std.mem.eql(u8, "c1", msg.value.dest));
     try testing.expect(1 == msg.value.body.object.get("msg_id").?.integer);
     try testing.expect(std.mem.eql(u8, "Hello, World!", msg.value.body.object.get("echo").?.string));
     try testing.expect(std.mem.eql(u8, "echo", msg.value.body.object.get("type").?.string));
 }
 
-// test "message from body struct" {
-//     const body = .{
-//         .type = "parts",
-//         .done = false,
-//         .node_ids = &[_][]const u8{ "joe", "thalia" },
-//     };
-//
-//     var arena = std.heap.ArenaAllocator.init(testing.allocator);
-//     defer arena.deinit();
-//
-//     var msg = try Message.from(arena.allocator(), "s1", "w2", body);
-//
-//     try testing.expect(std.mem.eql(u8, "s1", msg.src.?));
-//     try testing.expect(std.mem.eql(u8, "w2", msg.dest.?));
-//     try testing.expect(std.mem.eql(u8, body.type, msg.getType()));
-//     try testing.expect(msg.get("done").?.Bool == body.done);
-//
-//     const msg_ids = msg.get("node_ids").?.array;
-//     for (body.node_ids, msg_ids.items) |exp, val|
-//         try testing.expect(std.mem.eql(u8, exp, val.string));
-// }
+const MockService = struct {
+    recv_msg: std.ArrayList(Message(std.json.Value)),
+    allocator: Allocator,
+    state: State = .initialized,
+    node: *Node = undefined,
 
-// let's use this whacky pipe to tunnel messages from test to node
-const Pipe = @import("Pipe.zig");
-
-const Simulator = struct {
-    const ResetEvent = std.Thread.ResetEvent;
-    var pipe_buf: [1024]u8 = undefined;
-
-    use_events: bool, // signal whether to use ResetEvents
-    notify_send: ResetEvent = .{},
-    notify_read: ResetEvent = .{},
-    test_done_event: ResetEvent = .{},
-    millisecond: u64 = std.time.ns_per_ms,
-    pipe: Pipe = Pipe.Pipe(&pipe_buf), // horrible api design if you ask me
-
-    fn send(t: *@This(), message: anytype) void {
-        var stream = t.pipe.writer();
-        std.json.stringify(message, .{}, stream) catch unreachable;
-        _ = stream.write("\n") catch unreachable;
-
-        if (t.use_events) t.notify_send.set();
+    pub fn init(allocator: Allocator) @This() {
+        return .{ .allocator = allocator };
     }
 
-    // read something from the buffer
-    fn read(t: *@This(), allocator: Allocator) ?std.json.Parsed(Message(std.json.Value)) {
-        if (t.use_events) t.notify_read.wait();
-
-        var buf: [1024]u8 = undefined;
-        while (true) {
-            const bytes = t.pipe.reader().readUntilDelimiter(&buf, '\n') catch |err| switch (err) {
-                error.EndOfStream, error.OperationAborted => continue,
-                else => {
-                    log.err("failed to read json stream: {}", .{err});
-                    return null;
-                },
-            };
-
-            return Message(std.json.Value).decode(allocator, bytes) catch unreachable;
-        }
-        return null;
+    pub fn deinit(self: *@This()) void {
+        self.recv_msg.deinit();
+        if (self.node != undefined) self.node.deinit();
     }
 
-    // send a message into the simulated network and wait to read the response
-    // use this function only when you have use_events enabled
-    fn sendAndWaitToRead(
-        t: *@This(),
-        allocator: Allocator,
-        message: anytype,
-    ) std.json.Parsed(Message(std.json.Value)) {
-        if (!t.use_events) return null;
-
-        t.send(message);
-        return t.read(allocator);
+    fn getSelf(ctx: *anyopaque) *@This() {
+        return Node.alignCastPtr(MockService, ctx);
     }
 
-    pub fn wait(_: @This(), delay: u64) void {
-        std.time.sleep(delay);
+    fn start(ctx: *anyopaque, n: *Node) void {
+        const self = getSelf(ctx);
+        self.node = n;
+        self.status = .active;
+    }
+
+    fn state(ctx: *anyopaque) State {
+        return getSelf(ctx).state;
+    }
+
+    fn contains(_: *anyopaque, msg_type: []const u8) bool {
+        return std.mem.eql(u8, msg_type, "test");
+    }
+
+    fn stop(ctx: *anyopaque) void {
+        getSelf(ctx).state = .stopped;
+    }
+
+    fn handle(ctx: *anyopaque, msg: std.json.Parsed(Message(std.json.Value))) void {
+        var self = getSelf(ctx);
+        self.recv_msg.append(msg.value) catch unreachable;
     }
 };
 
-test "node - init message exchange (single thread)" {
-    // init a node and a tester
+test "node - state transitions; initialize and shutdown" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
     const node = try Node.init(arena.allocator());
-    node.status = .shutdown;
     defer node.deinit();
+    var buffer: [1024]u8 = undefined;
+    var pipe = @import("Pipe.zig").init(&buffer);
+    defer pipe.close();
 
-    var sim = Simulator{ .use_events = false };
-    const src = "n0";
-    const dest = "z0";
-
-    // send init message
-    const init_body = .{
-        .type = "init",
-        .msg_id = @as(usize, 1),
-        .node_id = "n0",
-        .node_ids = &[_][]const u8{ "n1", "n2" },
-    };
-
-    const message = Message(@TypeOf(init_body)){ .src = src, .dest = dest, .body = init_body };
-    try dump(message);
-
-    sim.send(message);
-
-    // run node to process message and send response
-    try node.run(sim.pipe.reader(), sim.pipe.writer());
-
-    // read out the response
-    var init_ok = sim.read(node.arena.allocator()) orelse unreachable;
-    try testing.expect(std.mem.eql(u8, "init_ok", init_ok.value.body.object.get("type").?.string));
-    try testing.expect(std.mem.eql(u8, "n0", init_ok.value.body.object.get("node_id").?.string));
+    const init_msg =
+        \\{"src": "test", "dest": "test", "body": {"type": "init", "msg_id": 0}}\n
+    ;
+    const shutdown_msg =
+        \\{"src": "test", "dest": "test", "body": {"type": "shutdown", "msg_id": 1}}\n
+    ;
+    const wrote = try pipe.writer().write(init_msg ++ shutdown_msg);
+    try testing.expectEqual(wrote, init_msg.len + shutdown_msg.len);
+    var out_buf: [shutdown_msg.len + init_msg.len + 20]u8 = undefined;
+    std.debug.print("{s}", .{try pipe.reader().readUntilDelimiter(&out_buf, '\n')});
 }
+
+// test "node - init message exchange (single thread)" {
+//     // init a node and a tester
+//     var arena = std.heap.arenaallocator.init(testing.allocator);
+//     defer arena.deinit();
+//
+//     const node = try node.init(arena.allocator());
+//     node.status = .shutdown;
+//     defer node.deinit();
+//
+//     var test_svc: MockService = .{};
+//     node.services.append(test_svc);
+//
+//     const src = "n0";
+//     const dest = "z0";
+//     const init_body = .{
+//         .type = "test",
+//         .msg_id = @as(usize, 1),
+//         .node_id = "n0",
+//         .node_ids = &[_][]const u8{ "n1", "n2" },
+//     };
+//
+//     const message = Message(@TypeOf(init_body)){ .src = src, .dest = dest, .body = init_body };
+//
+//     // read out the response
+//     var init_ok = sim.read(node.arena.allocator()) orelse unreachable;
+//     try testing.expect(std.mem.eql(u8, "init_ok", init_ok.value.body.object.get("type").?.string));
+//     try testing.expect(std.mem.eql(u8, "n0", init_ok.value.body.object.get("node_id").?.string));
+// }
 
 // test "node - init message exchange (multithread)" {
 //     if (@import("builtin").single_threaded) return error.SkipZigTest;
